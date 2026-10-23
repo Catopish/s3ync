@@ -1,0 +1,19 @@
+[global]
+state_dir = "/var/lib/s3ync"     # local state DB + status.json
+log_level = "info"               # override with S3YNC_LOG=s3ync=debug
+concurrency = 4                  # max parallel transfers across all jobs
+rescan_interval_secs = 3600      # full re-check against S3; 0 = off
+multipart_threshold_mb = 16
+part_size_mb = 16                # >= 5
+force_path_style = false         # true for MinIO / SeaweedFS / most S3-compatible stores
+
+[[job]]
+name    = "photos"               # unique key: [A-Za-z0-9_-]
+mode    = "sync"
+bucket  = "my-bucket"            # must already exist
+source  = "/home/me/photos"      # absolute path
+prefix  = "photos/"              # "dir" inside the bucket
+delete  = false                  # also delete from S3 when deleted locally
+exclude = ["*.tmp", "*.swp", ".git/", "**/node_modules/"]
+debounce_ms = 3000
+follow_symlinks = false

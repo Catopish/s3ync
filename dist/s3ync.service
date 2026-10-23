@@ -1,0 +1,21 @@
+[Unit]
+Description=s3ync - sync directories to S3
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/s3ync run --config /etc/s3ync/config.toml
+EnvironmentFile=/etc/s3ync/.env
+Restart=on-failure
+RestartSec=10
+# Run as the user that owns the synced dirs (needs read access to them).
+# User=me
+# Group=me
+StateDirectory=s3ync
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
