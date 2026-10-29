@@ -252,7 +252,7 @@ pub(crate) fn mtime_ns(m: &std::fs::Metadata) -> i64 {
     m.mtime() * 1_000_000_000 + m.mtime_nsec()
 }
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

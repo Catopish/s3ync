@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use config::{Config, Mode};
+use config::{Config, Mode, Naming};
 use s3::S3;
 use state::State;
 use sync::{JobCtx, JobStatus};
@@ -104,13 +104,17 @@ async fn check(cfg: Config) -> Result<()> {
                     job.bucket,
                     job.prefix
                 );
-                if job.mode == Mode::Backup {
+                if job.mode == Mode::Backup && job.naming == Naming::Fixed {
                     match s3.versioning_enabled(&job.bucket).await {
                         Ok(true) => {}
                         Ok(false) => println!(
                             "      note: versioning is off, each backup replaces the previous one"
                         ),
-                        Err(e) => println!("      note: {e:#}"),
+                        Err(e) => println!(
+                            "      note: could not check versioning ({e:#})\n      \
+                             without it each backup replaces the previous one; \
+                             consider naming = \"timestamp\" (R2 has no versioning)"
+                        ),
                     }
                 }
             }
@@ -196,6 +200,9 @@ async fn backup(cfg: Config, only: Option<String>) -> Result<()> {
                     r.key,
                     if r.uploaded { "uploaded" } else { "unchanged" }
                 );
+                if r.pruned > 0 {
+                    println!("{}: deleted {} old backup(s)", job.name, r.pruned);
+                }
                 if r.unreadable > 0 {
                     println!("{}: {} unreadable files left out", job.name, r.unreadable);
                     failed += 1;

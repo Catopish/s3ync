@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use crate::config::Job;
+use crate::config::{Job, Naming};
 use crate::filter::Filter;
 use crate::s3::S3;
-use crate::sync::{mtime_ns, walk};
+use crate::sync::{mtime_ns, unix_now, walk};
 
 const ZSTD_LEVEL: i32 = 3;
 
@@ -21,20 +21,36 @@ pub struct Report {
     pub uploaded: bool,
     /// Files that could not be read and are missing from the archive.
     pub unreadable: usize,
+    /// Old timestamped backups deleted because of `keep_last`.
+    pub pruned: usize,
 }
 
-/// Archives the job's source into `<prefix><name>.tar.zst` and uploads it, unless the
-/// object already in S3 has the same content hash. History is left to bucket versioning.
+/// Archives the job's source and uploads it, unless the latest backup in S3 has the same
+/// content hash. With `Naming::Fixed` history is left to bucket versioning, with
+/// `Naming::Timestamp` every upload gets its own key and `keep_last` prunes old ones.
 pub async fn run(job: &Job, s3: &S3, tmp_dir: &Path) -> Result<Report> {
-    let key = job.key_for(&format!("{}.tar.zst", job.name));
-    match s3.versioning_enabled(&job.bucket).await {
-        Ok(true) => {}
-        Ok(false) => warn!(
-            job = %job.name,
-            "bucket versioning is off: each backup replaces the previous one"
-        ),
-        Err(e) => warn!(job = %job.name, "could not check bucket versioning: {e:#}"),
-    }
+    let (key, previous) = match job.naming {
+        Naming::Fixed => {
+            match s3.versioning_enabled(&job.bucket).await {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    job = %job.name,
+                    "bucket versioning is off: each backup replaces the previous one"
+                ),
+                Err(e) => warn!(
+                    job = %job.name,
+                    "could not check bucket versioning ({e:#}); without it each backup \
+                     replaces the previous one, consider naming = \"timestamp\""
+                ),
+            }
+            let key = job.key_for(&format!("{}.tar.zst", job.name));
+            (key.clone(), Some(key))
+        }
+        Naming::Timestamp => {
+            let key = job.key_for(&format!("{0}/{0}-{1}.tar.zst", job.name, stamp(unix_now())));
+            (key, timestamped(job, s3).await?.pop())
+        }
+    };
 
     std::fs::create_dir_all(tmp_dir).with_context(|| format!("creating {}", tmp_dir.display()))?;
     let tmp = tempfile::Builder::new()
@@ -51,20 +67,93 @@ pub async fn run(job: &Job, s3: &S3, tmp_dir: &Path) -> Result<Report> {
     let size = tmp.as_file().metadata()?.len();
     info!(job = %job.name, files = archive.files, size, "archive built");
 
-    let uploaded = s3.remote_hash(&job.bucket, &key).await?.as_deref() != Some(hex.as_str());
-    if uploaded {
+    let unchanged = match &previous {
+        Some(prev) => s3.remote_hash(&job.bucket, prev).await?.as_deref() == Some(hex.as_str()),
+        None => false,
+    };
+    let key = if unchanged {
+        let prev = previous.unwrap();
+        info!(job = %job.name, key = %prev, "unchanged since last backup, not uploaded");
+        prev
+    } else {
         s3.upload(&job.bucket, &key, tmp.path(), size, &hex).await?;
         info!(job = %job.name, key = %key, "backup uploaded");
-    } else {
-        info!(job = %job.name, key = %key, "unchanged since last backup, not uploaded");
+        key
+    };
+
+    let mut pruned = 0;
+    if job.naming == Naming::Timestamp && job.keep_last > 0 {
+        let all = timestamped(job, s3).await?;
+        let excess = all.len().saturating_sub(job.keep_last as usize);
+        for old in &all[..excess] {
+            s3.delete(&job.bucket, old).await?;
+            info!(job = %job.name, key = %old, "old backup deleted");
+            pruned += 1;
+        }
     }
+
     Ok(Report {
         key,
         files: archive.files,
         size,
-        uploaded,
+        uploaded: !unchanged,
         unreadable: archive.unreadable,
+        pruned,
     })
+}
+
+/// Keys of the job's timestamped backups, oldest first. Anything else under the
+/// job's folder is ignored, so it is never picked as "latest" nor pruned.
+async fn timestamped(job: &Job, s3: &S3) -> Result<Vec<String>> {
+    let dir = job.key_for(&format!("{}/", job.name));
+    let lead = format!("{}-", job.name);
+    let mut keys: Vec<String> = s3
+        .list(&job.bucket, &dir)
+        .await?
+        .into_keys()
+        .filter(|k| {
+            k[dir.len()..]
+                .strip_prefix(&lead)
+                .and_then(|r| r.strip_suffix(".tar.zst"))
+                .is_some_and(is_stamp)
+        })
+        .collect();
+    // The stamp is fixed-width and most-significant first, so this is chronological.
+    keys.sort_unstable();
+    Ok(keys)
+}
+
+/// UTC `YYYY-MM-DDTHH-MM-SSZ` (no `:`, which is awkward in keys and file names).
+fn stamp(unix: u64) -> String {
+    let (days, secs) = ((unix / 86400) as i64, unix % 86400);
+    // Days since epoch -> civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}-{:02}-{:02}Z",
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60
+    )
+}
+
+fn is_stamp(s: &str) -> bool {
+    const SHAPE: &[u8] = b"0000-00-00T00-00-00Z";
+    s.len() == SHAPE.len()
+        && s.bytes().zip(SHAPE).all(|(c, &p)| {
+            if p == b'0' {
+                c.is_ascii_digit()
+            } else {
+                c == p
+            }
+        })
 }
 
 struct Archive {
@@ -167,7 +256,20 @@ mod tests {
             exclude: vec!["*.tmp".into()],
             debounce_ms: 0,
             follow_symlinks: false,
+            naming: Naming::Fixed,
+            keep_last: 0,
         }
+    }
+
+    #[test]
+    fn stamps() {
+        assert_eq!(stamp(0), "1970-01-01T00-00-00Z");
+        assert_eq!(stamp(951_782_400), "2000-02-29T00-00-00Z");
+        assert_eq!(stamp(1_793_275_335), "2026-10-29T12-02-15Z");
+        assert_eq!(stamp(4_102_444_799), "2099-12-31T23-59-59Z");
+        assert!(is_stamp(&stamp(1_793_275_335)));
+        assert!(!is_stamp("manual"));
+        assert!(!is_stamp("2026-10-29T12:02:15Z"));
     }
 
     fn archive(job: &Job) -> (Archive, Vec<u8>) {

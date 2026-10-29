@@ -51,6 +51,17 @@ pub enum Mode {
     Backup,
 }
 
+/// How backup archives are named in the bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Naming {
+    /// `<prefix><name>.tar.zst`, overwritten each run; history comes from bucket versioning.
+    #[default]
+    Fixed,
+    /// `<prefix><name>/<name>-<UTC time>.tar.zst`, for buckets without versioning (e.g. R2).
+    Timestamp,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Job {
@@ -68,6 +79,11 @@ pub struct Job {
     pub debounce_ms: u64,
     #[serde(default)]
     pub follow_symlinks: bool,
+    #[serde(default)]
+    pub naming: Naming,
+    /// Timestamped backups to keep, oldest are deleted after a run. 0 keeps all.
+    #[serde(default)]
+    pub keep_last: u32,
 }
 
 fn default_debounce_ms() -> u64 {
@@ -122,6 +138,15 @@ impl Config {
             }
             if job.mode == Mode::Backup && job.delete {
                 bail!("job {name:?}: delete is not supported for mode = \"backup\"");
+            }
+            if job.mode != Mode::Backup && (job.naming != Naming::Fixed || job.keep_last > 0) {
+                bail!("job {name:?}: naming and keep_last only apply to mode = \"backup\"");
+            }
+            if job.naming == Naming::Fixed && job.keep_last > 0 {
+                bail!(
+                    "job {name:?}: keep_last needs naming = \"timestamp\" \
+                     (fixed naming keeps history through bucket versioning)"
+                );
             }
             if job.bucket.is_empty() {
                 bail!("job {name:?}: bucket is empty");
@@ -201,5 +226,24 @@ mod tests {
         cfg.validate().unwrap();
         let mut cfg: Config = toml::from_str(&toml(true)).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn keep_last_needs_timestamp_naming() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = |mode, extra| {
+            format!(
+                "[[job]]\nname = \"x\"\nmode = \"{mode}\"\nbucket = \"b\"\nsource = \"{}\"\n{extra}\n",
+                dir.path().display()
+            )
+        };
+        let ok = |mode, extra| {
+            let mut cfg: Config = toml::from_str(&toml(mode, extra)).unwrap();
+            cfg.validate().is_ok()
+        };
+        assert!(ok("backup", "naming = \"timestamp\"\nkeep_last = 7"));
+        assert!(ok("backup", "naming = \"timestamp\""));
+        assert!(!ok("backup", "keep_last = 7"));
+        assert!(!ok("sync", "naming = \"timestamp\""));
     }
 }

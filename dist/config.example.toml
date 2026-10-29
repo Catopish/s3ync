@@ -27,3 +27,6 @@ bucket  = "my-bucket"            # enable versioning: every run overwrites the s
 source  = "/var/backups/db"
 prefix  = "backups/"
 exclude = ["*.tmp"]
+# No versioning (e.g. Cloudflare R2)? Keep timestamped copies instead:
+# naming    = "timestamp"          # -> backups/db-dumps/db-dumps-<UTC time>.tar.zst
+# keep_last = 14                   # older ones are deleted after each run; 0 = keep all

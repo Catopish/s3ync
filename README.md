@@ -60,6 +60,18 @@ AWS_REGION=us-east-1
 # AWS_ENDPOINT_URL=https://...   # S3-compatible stores; also set force_path_style = true
 ```
 
+For **Cloudflare R2** (free tier: 10 GB-month storage, 1M writes, 10M reads, free egress),
+create an API token with "Object Read & Write" for the bucket and use:
+
+```env
+AWS_ACCESS_KEY_ID=<token access key id>
+AWS_SECRET_ACCESS_KEY=<token secret>
+AWS_REGION=auto
+AWS_ENDPOINT_URL=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+```
+
+R2 has no bucket versioning, so give backup jobs `naming = "timestamp"` (see below).
+
 `config.toml` defines one or more jobs. See [`dist/config.example.toml`](dist/config.example.toml)
 for all options.
 
@@ -87,6 +99,19 @@ prefix  = "backups/"     # -> s3://my-bucket/backups/db-dumps.tar.zst
 exclude = ["*.tmp"]
 ```
 
+By default every run overwrites that one key and older backups live on as object
+versions. For buckets without versioning (Cloudflare R2, some self-hosted stores) use
+timestamped keys instead; s3ync then keeps the newest `keep_last` (0 = all) and deletes
+older ones after each run:
+
+```toml
+naming    = "timestamp"  # -> s3://my-bucket/backups/db-dumps/db-dumps-2026-10-29T02-00-00Z.tar.zst
+keep_last = 14
+```
+
+An unchanged run never adds a new key, so `keep_last` counts distinct backups, and the
+newest one is never deleted however old it is. Other objects in that folder are left alone.
+
 Exclude patterns are gitignore-like: `*.tmp` matches at any depth, `dir/` matches a
 directory and everything in it, a pattern containing `/` (like `build/out`) is anchored
 to `source`.
@@ -99,7 +124,9 @@ s3ync never creates buckets; create it yourself. Recommended:
   rely on it: every run overwrites the same key, older backups are the previous versions.
 - For backups, add a lifecycle rule that **expires noncurrent versions** to control how
   many old backups you keep (e.g. "keep 7 noncurrent versions" or "delete after 30 days").
-  s3ync never deletes backups itself.
+  s3ync never deletes these itself. (Age-based expiry is not safe with
+  `naming = "timestamp"`: if nothing changes for a while, it would delete the only
+  backup. Use `keep_last` there.)
 - Add a lifecycle rule to **abort incomplete multipart uploads** after a day or so
   (left behind if s3ync is killed mid-upload).
 
