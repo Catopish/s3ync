@@ -1,0 +1,23 @@
+# Live sync + scheduled backups in one container.
+#   docker compose -f dist/compose.yaml up -d --build
+#   docker compose -f dist/compose.yaml exec s3ync s3ync status
+#   docker compose -f dist/compose.yaml run --rm s3ync backup --job db-dumps   # one-off
+services:
+  s3ync:
+    build: ..
+    restart: unless-stopped
+    env_file: /etc/s3ync/.env
+    environment:
+      TZ: Etc/UTC                  # cron schedules use this time zone
+    volumes:
+      - /etc/s3ync/config.toml:/etc/s3ync/config.toml:ro
+      - s3ync-state:/var/lib/s3ync
+      # Mount every job's `source` at the same path it has in config.toml:
+      - /home/me/photos:/home/me/photos:ro
+      - /var/backups/db:/var/backups/db:ro
+    # Run as the owner of the mounted dirs if root is not wanted (the state volume
+    # must then be writable by that user too):
+    # user: "1000:1000"
+
+volumes:
+  s3ync-state:

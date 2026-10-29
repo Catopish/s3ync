@@ -28,7 +28,7 @@ pub struct JobCtx {
     filter: Filter,
     s3: S3,
     state: State,
-    pub status: Mutex<JobStatus>,
+    pub status: Arc<Mutex<JobStatus>>,
 }
 
 /// Snapshot of a job's progress, written to `status.json` by the daemon.
@@ -40,6 +40,11 @@ pub struct JobStatus {
     pub pending: usize,
     pub last_reconcile_unix: Option<u64>,
     pub last_error: Option<String>,
+    /// Backup jobs only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_backup_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_backup_unix: Option<u64>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -72,7 +77,7 @@ impl JobCtx {
             filter,
             s3,
             state,
-            status: Mutex::default(),
+            status: Arc::default(),
         })
     }
 

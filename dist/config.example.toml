@@ -18,8 +18,8 @@ exclude = ["*.tmp", "*.swp", ".git/", "**/node_modules/"]
 debounce_ms = 3000
 follow_symlinks = false
 
-# Scheduled backup: `s3ync backup` packs `source` into s3://<bucket>/<prefix><name>.tar.zst.
-# Not run by the daemon; schedule it with dist/s3ync-backup@.timer or cron.
+# Backup: packs `source` into s3://<bucket>/<prefix><name>.tar.zst.
+# Taken by the daemon on `schedule`, or any time with `s3ync backup --job db-dumps`.
 [[job]]
 name    = "db-dumps"
 mode    = "backup"
@@ -27,6 +27,7 @@ bucket  = "my-bucket"            # enable versioning: every run overwrites the s
 source  = "/var/backups/db"
 prefix  = "backups/"
 exclude = ["*.tmp"]
+schedule = "0 2 * * *"           # cron, local time (TZ); omit to only run via `s3ync backup`
 # No versioning (e.g. Cloudflare R2)? Keep timestamped copies instead:
 # naming    = "timestamp"          # -> backups/db-dumps/db-dumps-<UTC time>.tar.zst
 # keep_last = 14                   # older ones are deleted after each run; 0 = keep all

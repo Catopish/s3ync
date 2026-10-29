@@ -1,16 +1,133 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tracing::{info, warn};
+use chrono::{DateTime, Local};
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 
 use crate::config::{Job, Naming};
 use crate::filter::Filter;
 use crate::s3::S3;
-use crate::sync::{mtime_ns, unix_now, walk};
+use crate::sync::{JobStatus, mtime_ns, unix_now, walk};
 
 const ZSTD_LEVEL: i32 = 3;
+const RETRY_BASE: Duration = Duration::from_secs(60);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(3600);
+/// When each backup job last succeeded (unix secs), so a restarted daemon catches up.
+const LAST_RUN_FILE: &str = "backups.json";
+
+/// Takes the job's backups on its `schedule` until `shutdown`. A run missed while the
+/// daemon was down happens right away; a failed run is retried with backoff until the
+/// next scheduled time.
+pub async fn run_scheduled(
+    job: Job,
+    s3: S3,
+    state_dir: PathBuf,
+    sem: Arc<Semaphore>,
+    status: Arc<Mutex<JobStatus>>,
+    shutdown: CancellationToken,
+) {
+    let cron = job
+        .cron
+        .clone()
+        .expect("only jobs with a schedule are scheduled");
+    let next_after = |t: DateTime<Local>| cron.find_next_occurrence(&t, false);
+    let tmp = tmp_dir(&state_dir);
+    let mut last = last_runs(&state_dir).get(&job.name).copied();
+    status.lock().unwrap().last_backup_unix = last;
+    let mut failures = 0u32;
+
+    loop {
+        let now = Local::now();
+        let due = if failures > 0 {
+            let backoff = (RETRY_BASE * 2u32.saturating_pow(failures - 1)).min(MAX_RETRY_DELAY);
+            next_after(now).map(|n| n.min(now + backoff))
+        } else {
+            next_after(last.and_then(local_time).unwrap_or(now))
+        };
+        let due = match due {
+            Ok(d) => d,
+            Err(e) => {
+                error!(job = %job.name, "no next run for schedule: {e}");
+                return;
+            }
+        };
+        status.lock().unwrap().next_backup_unix = Some(due.timestamp().max(0) as u64);
+
+        // Short steps: tokio's clock stops during system suspend, the wall clock doesn't.
+        while let Ok(left) = (due - Local::now()).to_std() {
+            tokio::select! {
+                _ = tokio::time::sleep(left.min(Duration::from_secs(60))) => {}
+                _ = shutdown.cancelled() => return,
+            }
+        }
+        if failures == 0 && due < now {
+            info!(job = %job.name, scheduled = %due, "missed a scheduled backup, running it now");
+        }
+
+        let _permit = tokio::select! {
+            p = sem.acquire() => p.expect("semaphore closed"),
+            _ = shutdown.cancelled() => return,
+        };
+        let started = unix_now();
+        let res = tokio::select! {
+            r = run(&job, &s3, &tmp) => r,
+            _ = shutdown.cancelled() => {
+                warn!(job = %job.name, "backup interrupted by shutdown");
+                return;
+            }
+        };
+        let mut st = status.lock().unwrap();
+        match res {
+            Ok(r) => {
+                failures = 0;
+                last = Some(started);
+                st.last_backup_unix = last;
+                st.uploaded += u64::from(r.uploaded);
+                st.deleted += r.pruned as u64;
+                if r.unreadable > 0 {
+                    st.last_error = Some(format!("{} unreadable files left out", r.unreadable));
+                }
+                if let Err(e) = record_success(&state_dir, &job.name, started) {
+                    warn!(job = %job.name, "{e:#}");
+                }
+            }
+            Err(e) => {
+                failures += 1;
+                error!(job = %job.name, "backup failed: {e:#}");
+                st.failed += 1;
+                st.last_error = Some(format!("backup: {e:#}"));
+            }
+        }
+    }
+}
+
+fn local_time(unix: u64) -> Option<DateTime<Local>> {
+    DateTime::from_timestamp(unix as i64, 0).map(|t| t.with_timezone(&Local))
+}
+
+pub fn last_runs(state_dir: &Path) -> HashMap<String, u64> {
+    std::fs::read(state_dir.join(LAST_RUN_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+pub fn record_success(state_dir: &Path, job: &str, at: u64) -> Result<()> {
+    let mut runs = last_runs(state_dir);
+    runs.insert(job.to_string(), at);
+    // Per-process temp name: `s3ync backup` may run next to the daemon.
+    let tmp = state_dir.join(format!("{LAST_RUN_FILE}.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&runs)?)
+        .and_then(|_| std::fs::rename(&tmp, state_dir.join(LAST_RUN_FILE)))
+        .with_context(|| format!("recording backup time in {}", state_dir.display()))
+}
 
 #[derive(Debug)]
 pub struct Report {
@@ -258,6 +375,8 @@ mod tests {
             follow_symlinks: false,
             naming: Naming::Fixed,
             keep_last: 0,
+            schedule: None,
+            cron: None,
         }
     }
 

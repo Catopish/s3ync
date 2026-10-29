@@ -4,6 +4,7 @@ A small daemon that keeps local directories in sync with an S3 bucket.
 It watches for changes (inotify) and uploads them within seconds, and does a full
 reconcile on startup and periodically so nothing is missed while it was down.
 It can also take scheduled backups: a directory packed into one `.tar.zst` archive.
+Both are configured in one `config.toml` and run by the same daemon.
 
 - One-way: local → S3. Objects that exist only in S3 are never touched.
 - Files are stored as plain objects (`<prefix>/<relative path>`), browsable in the console.
@@ -13,6 +14,11 @@ It can also take scheduled backups: a directory packed into one `.tar.zst` archi
 > Status: live sync and scheduled backups work. Client-side encryption is planned.
 
 ## Install
+
+s3ync runs the same way everywhere: `s3ync run` is the daemon (live sync + backups on
+their `schedule`), `s3ync backup` takes backups once and exits. Pick how to host it:
+
+### systemd
 
 ```sh
 cargo build --release
@@ -32,20 +38,29 @@ s3ync -c /etc/s3ync/config.toml status
 ```
 
 The service runs as root by default; set `User=` in the unit to the user that owns the
-synced directories.
+synced directories. Schedules use the host's time zone.
 
-For backup jobs, install the timer template and enable one timer per job (no daemon needed):
+### Docker
 
 ```sh
-sudo cp dist/s3ync-backup@.service dist/s3ync-backup@.timer /etc/systemd/system/
-sudo systemctl enable --now s3ync-backup@db-dumps.timer   # daily at 02:00
-sudo systemctl edit s3ync-backup@db-dumps.timer           # change the schedule
+docker compose -f dist/compose.yaml up -d --build
+docker compose -f dist/compose.yaml exec s3ync s3ync status
 ```
 
-Or use cron instead:
+Edit [`dist/compose.yaml`](dist/compose.yaml) first: it mounts `/etc/s3ync/config.toml`,
+reads credentials from `/etc/s3ync/.env`, and needs every job's `source` mounted at the
+same path as in the config. Set `TZ` for schedules (default UTC). On Docker Desktop/colima
+file events from the host may not reach the container; `rescan_interval_secs` still
+catches those changes, just later.
 
-```cron
-0 2 * * *  /usr/local/bin/s3ync -c /etc/s3ync/config.toml --env /etc/s3ync/.env backup --job db-dumps
+### One-off backups
+
+Without a daemon, run backups when you like (a manual run, cron, a CI job, ...):
+
+```sh
+s3ync -c /etc/s3ync/config.toml --env /etc/s3ync/.env backup             # all backup jobs
+s3ync -c /etc/s3ync/config.toml --env /etc/s3ync/.env backup --job db-dumps
+docker compose -f dist/compose.yaml run --rm s3ync backup --job db-dumps
 ```
 
 ## Configuration
@@ -86,8 +101,9 @@ delete  = false
 exclude = ["*.tmp", ".git/"]
 ```
 
-`mode = "sync"` jobs are handled by the daemon. `mode = "backup"` jobs are ignored by
-it and only run by `s3ync backup` (`delete` is not allowed for them):
+`mode = "sync"` jobs are watched by the daemon. `mode = "backup"` jobs are taken by the
+daemon on their `schedule` (cron syntax, local time), and by `s3ync backup` at any time;
+without a `schedule` only the latter. `delete` is not allowed for them:
 
 ```toml
 [[job]]
@@ -97,7 +113,12 @@ bucket  = "my-bucket"
 source  = "/var/backups/db"
 prefix  = "backups/"     # -> s3://my-bucket/backups/db-dumps.tar.zst
 exclude = ["*.tmp"]
+schedule = "0 2 * * *"   # daily at 02:00
 ```
+
+If the daemon was down at a scheduled time, the missed backup runs as soon as it starts
+again (the last successful run per job is kept in `state_dir/backups.json`). A failed
+backup is retried with backoff (1 min doubling up to 1 h) until the next scheduled time.
 
 By default every run overwrites that one key and older backups live on as object
 versions. For buckets without versioning (Cloudflare R2, some self-hosted stores) use
@@ -150,10 +171,10 @@ Minimal IAM policy:
 
 | Command | |
 |---|---|
-| `s3ync run` | Daemon: watch and sync until SIGTERM |
+| `s3ync run` | Daemon: live sync and scheduled backups until SIGTERM |
 | `s3ync check` | Validate config, check each bucket is reachable and listable |
 | `s3ync once [--job NAME]` | One reconcile pass, then exit (non-zero if anything failed) |
-| `s3ync status` | Per-job counters from the running daemon |
+| `s3ync status` | Per-job counters from the running daemon (last/next backup too) |
 | `s3ync backup [--job NAME]` | Archive and upload backup jobs, then exit (non-zero if any failed) |
 
 Global flags: `-c/--config` (default `/etc/s3ync/config.toml`, env `S3YNC_CONFIG`),

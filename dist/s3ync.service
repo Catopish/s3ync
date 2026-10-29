@@ -1,5 +1,5 @@
 [Unit]
-Description=s3ync - sync directories to S3
+Description=s3ync - live sync and scheduled backups to S3
 After=network-online.target
 Wants=network-online.target
 

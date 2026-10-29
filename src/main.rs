@@ -7,7 +7,7 @@ mod sync;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -104,6 +104,11 @@ async fn check(cfg: Config) -> Result<()> {
                     job.bucket,
                     job.prefix
                 );
+                if let Some(cron) = &job.cron
+                    && let Ok(next) = cron.find_next_occurrence(&chrono::Local::now(), false)
+                {
+                    println!("      next backup: {}", next.format("%Y-%m-%d %H:%M %Z"));
+                }
                 if job.mode == Mode::Backup && job.naming == Naming::Fixed {
                     match s3.versioning_enabled(&job.bucket).await {
                         Ok(true) => {}
@@ -189,8 +194,12 @@ async fn backup(cfg: Config, only: Option<String>) -> Result<()> {
     let tmp = backup::tmp_dir(&cfg.global.state_dir);
     let mut failed = 0;
     for job in jobs {
+        let started = sync::unix_now();
         match backup::run(job, &s3, &tmp).await {
             Ok(r) => {
+                if let Err(e) = backup::record_success(&cfg.global.state_dir, &job.name, started) {
+                    warn!(job = %job.name, "{e:#}");
+                }
                 println!(
                     "{}: {} files, {:.1} MiB -> s3://{}/{} ({})",
                     job.name,
@@ -222,6 +231,10 @@ async fn backup(cfg: Config, only: Option<String>) -> Result<()> {
 
 async fn run(cfg: Config) -> Result<()> {
     let jobs = build_jobs(&cfg, None).await?;
+    let scheduled: Vec<_> = cfg.jobs.iter().filter(|j| j.cron.is_some()).collect();
+    if jobs.is_empty() && scheduled.is_empty() {
+        bail!("nothing to run: no sync jobs and no backup jobs with a schedule");
+    }
     let shutdown = CancellationToken::new();
     let sem = Arc::new(Semaphore::new(cfg.global.concurrency));
     let rescan = (cfg.global.rescan_interval_secs > 0)
@@ -251,8 +264,37 @@ async fn run(cfg: Config) -> Result<()> {
     }
     drop(ready_tx);
 
+    let mut statuses: Vec<_> = jobs
+        .iter()
+        .map(|j| (j.job.name.clone(), j.status.clone()))
+        .collect();
+    if !scheduled.is_empty() {
+        let s3 = S3::new(&cfg.global).await?;
+        for job in scheduled {
+            s3.check(&job.bucket, &job.prefix)
+                .await
+                .with_context(|| format!("job {:?}", job.name))?;
+            let status = Arc::new(Mutex::new(JobStatus::default()));
+            statuses.push((job.name.clone(), status.clone()));
+            handles.push(tokio::spawn({
+                let fut = backup::run_scheduled(
+                    job.clone(),
+                    s3.clone(),
+                    cfg.global.state_dir.clone(),
+                    sem.clone(),
+                    status,
+                    shutdown.clone(),
+                );
+                async move {
+                    fut.await;
+                    Ok(())
+                }
+            }));
+        }
+    }
+
     tokio::spawn(write_status_loop(
-        jobs.clone(),
+        statuses.clone(),
         cfg.global.state_dir.clone(),
         shutdown.clone(),
     ));
@@ -277,7 +319,7 @@ async fn run(cfg: Config) -> Result<()> {
             res = Err(e);
         }
     }
-    write_status(&jobs, &cfg.global.state_dir);
+    write_status(&statuses, &cfg.global.state_dir);
     res
 }
 
@@ -293,10 +335,12 @@ async fn wait_for_signal(shutdown: &CancellationToken) {
 
 const STATUS_FILE: &str = "status.json";
 
-fn write_status(jobs: &[Arc<JobCtx>], dir: &Path) {
+type Statuses = Vec<(String, Arc<Mutex<JobStatus>>)>;
+
+fn write_status(jobs: &Statuses, dir: &Path) {
     let map: BTreeMap<_, _> = jobs
         .iter()
-        .map(|j| (j.job.name.clone(), j.status.lock().unwrap().clone()))
+        .map(|(name, st)| (name.clone(), st.lock().unwrap().clone()))
         .collect();
     let pending: usize = map.values().map(|s| s.pending).sum();
     let _ = sd_notify::notify(&[NotifyState::Status(&format!(
@@ -313,7 +357,7 @@ fn write_status(jobs: &[Arc<JobCtx>], dir: &Path) {
     }
 }
 
-async fn write_status_loop(jobs: Vec<Arc<JobCtx>>, dir: PathBuf, shutdown: CancellationToken) {
+async fn write_status_loop(jobs: Statuses, dir: PathBuf, shutdown: CancellationToken) {
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
@@ -338,21 +382,24 @@ fn status(cfg: &Config) -> Result<()> {
             age.as_secs()
         );
     }
-    println!(
-        "{:<16} {:>8} {:>8} {:>8} {:>8}  last reconcile",
-        "job", "pending", "uploaded", "deleted", "failed"
-    );
-    for (name, s) in &map {
-        let last = s
-            .last_reconcile_unix
-            .map(|t| {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(t);
-                format!("{}s ago", now.saturating_sub(t))
-            })
-            .unwrap_or_else(|| "never".into());
+    let now = sync::unix_now();
+    let is_backup = |name: &str| {
+        cfg.jobs
+            .iter()
+            .any(|j| j.name == name && j.mode == Mode::Backup)
+    };
+    let (backups, syncs): (Vec<_>, Vec<_>) = map.iter().partition(|(n, _)| is_backup(n));
+    if !syncs.is_empty() {
+        println!(
+            "{:<16} {:>8} {:>8} {:>8} {:>8}  last reconcile",
+            "job", "pending", "uploaded", "deleted", "failed"
+        );
+    }
+    for (name, s) in &syncs {
+        let last = s.last_reconcile_unix.map_or_else(
+            || "never".into(),
+            |t| format!("{} ago", human(now.saturating_sub(t))),
+        );
         println!(
             "{name:<16} {:>8} {:>8} {:>8} {:>8}  {last}",
             s.pending, s.uploaded, s.deleted, s.failed
@@ -361,5 +408,44 @@ fn status(cfg: &Config) -> Result<()> {
             println!("  last error: {e}");
         }
     }
+    if !backups.is_empty() {
+        if !syncs.is_empty() {
+            println!();
+        }
+        println!(
+            "{:<16} {:>8} {:>8} {:>8}  {:<14} next",
+            "backup job", "uploaded", "pruned", "failed", "last ok"
+        );
+    }
+    for (name, s) in &backups {
+        let last = s.last_backup_unix.map_or_else(
+            || "never".into(),
+            |t| format!("{} ago", human(now.saturating_sub(t))),
+        );
+        let next = s.next_backup_unix.map_or_else(
+            || "-".into(),
+            |t| match t.checked_sub(now) {
+                Some(d) if d > 0 => format!("in {}", human(d)),
+                _ => "now".into(),
+            },
+        );
+        println!(
+            "{name:<16} {:>8} {:>8} {:>8}  {last:<14} {next}",
+            s.uploaded, s.deleted, s.failed
+        );
+        if let Some(e) = &s.last_error {
+            println!("  last error: {e}");
+        }
+    }
     Ok(())
+}
+
+/// 42s, 5m, 3h, 2d
+fn human(secs: u64) -> String {
+    match secs {
+        s if s < 120 => format!("{s}s"),
+        s if s < 7200 => format!("{}m", s / 60),
+        s if s < 172_800 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86400),
+    }
 }

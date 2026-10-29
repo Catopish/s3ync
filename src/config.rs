@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use croner::Cron;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +85,11 @@ pub struct Job {
     /// Timestamped backups to keep, oldest are deleted after a run. 0 keeps all.
     #[serde(default)]
     pub keep_last: u32,
+    /// Cron expression (local time) for backups taken by the daemon, e.g. "0 2 * * *".
+    /// Without it the job only runs via `s3ync backup`.
+    pub schedule: Option<String>,
+    #[serde(skip)]
+    pub cron: Option<Cron>,
 }
 
 fn default_debounce_ms() -> u64 {
@@ -141,6 +147,21 @@ impl Config {
             }
             if job.mode != Mode::Backup && (job.naming != Naming::Fixed || job.keep_last > 0) {
                 bail!("job {name:?}: naming and keep_last only apply to mode = \"backup\"");
+            }
+            if let Some(expr) = &job.schedule {
+                if job.mode != Mode::Backup {
+                    bail!("job {name:?}: schedule only applies to mode = \"backup\"");
+                }
+                let cron = expr
+                    .parse::<Cron>()
+                    .with_context(|| format!("job {name:?}: invalid schedule {expr:?}"))?;
+                if cron
+                    .find_next_occurrence(&chrono::Local::now(), false)
+                    .is_err()
+                {
+                    bail!("job {name:?}: schedule {expr:?} never fires");
+                }
+                job.cron = Some(cron);
             }
             if job.naming == Naming::Fixed && job.keep_last > 0 {
                 bail!(
@@ -245,5 +266,9 @@ mod tests {
         assert!(ok("backup", "naming = \"timestamp\""));
         assert!(!ok("backup", "keep_last = 7"));
         assert!(!ok("sync", "naming = \"timestamp\""));
+        assert!(ok("backup", "schedule = \"0 2 * * *\""));
+        assert!(!ok("backup", "schedule = \"0 25 * * *\""));
+        assert!(!ok("backup", "schedule = \"0 0 30 2 *\""));
+        assert!(!ok("sync", "schedule = \"0 2 * * *\""));
     }
 }
