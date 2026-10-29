@@ -17,3 +17,13 @@ delete  = false                  # also delete from S3 when deleted locally
 exclude = ["*.tmp", "*.swp", ".git/", "**/node_modules/"]
 debounce_ms = 3000
 follow_symlinks = false
+
+# Scheduled backup: `s3ync backup` packs `source` into s3://<bucket>/<prefix><name>.tar.zst.
+# Not run by the daemon; schedule it with dist/s3ync-backup@.timer or cron.
+[[job]]
+name    = "db-dumps"
+mode    = "backup"
+bucket  = "my-bucket"            # enable versioning: every run overwrites the same key
+source  = "/var/backups/db"
+prefix  = "backups/"
+exclude = ["*.tmp"]

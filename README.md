@@ -3,13 +3,14 @@
 A small daemon that keeps local directories in sync with an S3 bucket.
 It watches for changes (inotify) and uploads them within seconds, and does a full
 reconcile on startup and periodically so nothing is missed while it was down.
+It can also take scheduled backups: a directory packed into one `.tar.zst` archive.
 
 - One-way: local → S3. Objects that exist only in S3 are never touched.
 - Files are stored as plain objects (`<prefix>/<relative path>`), browsable in the console.
 - Restarts are cheap: a local state DB remembers what was uploaded.
 - Works with AWS S3 and S3-compatible stores (MinIO, SeaweedFS, R2, ...).
 
-> Status: live sync works. Scheduled backups and client-side encryption are planned.
+> Status: live sync and scheduled backups work. Client-side encryption is planned.
 
 ## Install
 
@@ -32,6 +33,20 @@ s3ync -c /etc/s3ync/config.toml status
 
 The service runs as root by default; set `User=` in the unit to the user that owns the
 synced directories.
+
+For backup jobs, install the timer template and enable one timer per job (no daemon needed):
+
+```sh
+sudo cp dist/s3ync-backup@.service dist/s3ync-backup@.timer /etc/systemd/system/
+sudo systemctl enable --now s3ync-backup@db-dumps.timer   # daily at 02:00
+sudo systemctl edit s3ync-backup@db-dumps.timer           # change the schedule
+```
+
+Or use cron instead:
+
+```cron
+0 2 * * *  /usr/local/bin/s3ync -c /etc/s3ync/config.toml --env /etc/s3ync/.env backup --job db-dumps
+```
 
 ## Configuration
 
@@ -59,6 +74,19 @@ delete  = false
 exclude = ["*.tmp", ".git/"]
 ```
 
+`mode = "sync"` jobs are handled by the daemon. `mode = "backup"` jobs are ignored by
+it and only run by `s3ync backup` (`delete` is not allowed for them):
+
+```toml
+[[job]]
+name    = "db-dumps"
+mode    = "backup"
+bucket  = "my-bucket"
+source  = "/var/backups/db"
+prefix  = "backups/"     # -> s3://my-bucket/backups/db-dumps.tar.zst
+exclude = ["*.tmp"]
+```
+
 Exclude patterns are gitignore-like: `*.tmp` matches at any depth, `dir/` matches a
 directory and everything in it, a pattern containing `/` (like `build/out`) is anchored
 to `source`.
@@ -67,7 +95,11 @@ to `source`.
 
 s3ync never creates buckets; create it yourself. Recommended:
 
-- Enable **versioning**, so an accidental overwrite or delete can be undone.
+- Enable **versioning**, so an accidental overwrite or delete can be undone. Backup jobs
+  rely on it: every run overwrites the same key, older backups are the previous versions.
+- For backups, add a lifecycle rule that **expires noncurrent versions** to control how
+  many old backups you keep (e.g. "keep 7 noncurrent versions" or "delete after 30 days").
+  s3ync never deletes backups itself.
 - Add a lifecycle rule to **abort incomplete multipart uploads** after a day or so
   (left behind if s3ync is killed mid-upload).
 
@@ -78,6 +110,8 @@ Minimal IAM policy:
   "Version": "2012-10-17",
   "Statement": [
     { "Effect": "Allow", "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::my-bucket" },
+    { "Effect": "Allow", "Action": ["s3:GetBucketVersioning"],
       "Resource": "arn:aws:s3:::my-bucket" },
     { "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
       "Resource": "arn:aws:s3:::my-bucket/*" }
@@ -93,6 +127,7 @@ Minimal IAM policy:
 | `s3ync check` | Validate config, check each bucket is reachable and listable |
 | `s3ync once [--job NAME]` | One reconcile pass, then exit (non-zero if anything failed) |
 | `s3ync status` | Per-job counters from the running daemon |
+| `s3ync backup [--job NAME]` | Archive and upload backup jobs, then exit (non-zero if any failed) |
 
 Global flags: `-c/--config` (default `/etc/s3ync/config.toml`, env `S3YNC_CONFIG`),
 `--env` (default `./.env` if present, env `S3YNC_ENV`). Log level: `S3YNC_LOG=s3ync=debug`.
@@ -106,6 +141,13 @@ Global flags: `-c/--config` (default `/etc/s3ync/config.toml`, env `S3YNC_CONFIG
   bounded concurrency and retry with exponential backoff (up to 5 min).
 - **Torn writes**: if a file changes while it's being uploaded, the upload is retried.
 - **Deletes**: only for paths s3ync uploaded itself, and only with `delete = true`.
+- **Backups**: files are packed in sorted order into a tar stream, compressed with zstd
+  into a temp file under `state_dir/tmp` (needs free space for one archive), then
+  uploaded. The BLAKE3 hash of the tar stream is stored on the object; if it matches
+  the current object, nothing is uploaded, so unchanged runs don't add versions.
+  Unreadable files are skipped with a warning and make the run exit non-zero; files
+  changing mid-backup are archived as-is with a warning. Symlinks and empty
+  directories are not included (unless `follow_symlinks = true`).
 - **Large trees**: each directory uses an inotify watch. If you hit the limit, raise it:
   `echo fs.inotify.max_user_watches=524288 | sudo tee /etc/sysctl.d/90-s3ync.conf && sudo sysctl --system`.
 

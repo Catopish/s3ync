@@ -1,0 +1,18 @@
+[Unit]
+Description=s3ync - back up job %i to S3
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/s3ync backup --config /etc/s3ync/config.toml --job %i
+EnvironmentFile=/etc/s3ync/.env
+# Run as the user that owns the backed up dirs (needs read access to them).
+# User=me
+# Group=me
+StateDirectory=s3ync
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true

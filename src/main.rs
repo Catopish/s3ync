@@ -1,3 +1,4 @@
+mod backup;
 mod config;
 mod filter;
 mod s3;
@@ -54,6 +55,12 @@ enum Cmd {
     },
     /// Show per-job status of the running daemon.
     Status,
+    /// Archive backup jobs and upload them (meant for a timer or cron).
+    Backup {
+        /// Only this job.
+        #[arg(long)]
+        job: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -79,6 +86,7 @@ fn main() -> Result<()> {
             Cmd::Check => check(cfg).await,
             Cmd::Once { job } => once(cfg, job).await,
             Cmd::Status => status(&cfg),
+            Cmd::Backup { job } => backup(cfg, job).await,
         }
     })
 }
@@ -88,13 +96,24 @@ async fn check(cfg: Config) -> Result<()> {
     let mut ok = true;
     for job in &cfg.jobs {
         match s3.check(&job.bucket, &job.prefix).await {
-            Ok(()) => println!(
-                "ok    {:<16} {} -> s3://{}/{}",
-                job.name,
-                job.source.display(),
-                job.bucket,
-                job.prefix
-            ),
+            Ok(()) => {
+                println!(
+                    "ok    {:<16} {} -> s3://{}/{}",
+                    job.name,
+                    job.source.display(),
+                    job.bucket,
+                    job.prefix
+                );
+                if job.mode == Mode::Backup {
+                    match s3.versioning_enabled(&job.bucket).await {
+                        Ok(true) => {}
+                        Ok(false) => println!(
+                            "      note: versioning is off, each backup replaces the previous one"
+                        ),
+                        Err(e) => println!("      note: {e:#}"),
+                    }
+                }
+            }
             Err(e) => {
                 ok = false;
                 println!("FAIL  {:<16} {e:#}", job.name);
@@ -146,6 +165,50 @@ async fn once(cfg: Config, only: Option<String>) -> Result<()> {
     }
     if failed > 0 {
         bail!("{failed} paths failed");
+    }
+    Ok(())
+}
+
+async fn backup(cfg: Config, only: Option<String>) -> Result<()> {
+    let jobs: Vec<_> = cfg
+        .jobs
+        .iter()
+        .filter(|j| j.mode == Mode::Backup && only.as_ref().is_none_or(|n| *n == j.name))
+        .collect();
+    if jobs.is_empty() {
+        match only {
+            Some(n) => bail!("no backup job named {n:?}"),
+            None => bail!("no jobs with mode = \"backup\" in config"),
+        }
+    }
+    let s3 = S3::new(&cfg.global).await?;
+    let tmp = backup::tmp_dir(&cfg.global.state_dir);
+    let mut failed = 0;
+    for job in jobs {
+        match backup::run(job, &s3, &tmp).await {
+            Ok(r) => {
+                println!(
+                    "{}: {} files, {:.1} MiB -> s3://{}/{} ({})",
+                    job.name,
+                    r.files,
+                    r.size as f64 / (1024.0 * 1024.0),
+                    job.bucket,
+                    r.key,
+                    if r.uploaded { "uploaded" } else { "unchanged" }
+                );
+                if r.unreadable > 0 {
+                    println!("{}: {} unreadable files left out", job.name, r.unreadable);
+                    failed += 1;
+                }
+            }
+            Err(e) => {
+                error!(job = %job.name, "backup failed: {e:#}");
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} backup job(s) failed or are incomplete");
     }
     Ok(())
 }

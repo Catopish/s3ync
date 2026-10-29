@@ -248,7 +248,7 @@ impl JobCtx {
     }
 }
 
-fn mtime_ns(m: &std::fs::Metadata) -> i64 {
+pub(crate) fn mtime_ns(m: &std::fs::Metadata) -> i64 {
     m.mtime() * 1_000_000_000 + m.mtime_nsec()
 }
 
@@ -272,7 +272,12 @@ async fn hash_file(path: PathBuf) -> Result<blake3::Hash> {
 }
 
 /// Regular files under `dir` (relative to `root`) that aren't excluded: (rel, size, mtime_ns).
-fn walk(root: &Path, dir: &Path, filter: &Filter, follow: bool) -> Vec<(String, u64, i64)> {
+pub(crate) fn walk(
+    root: &Path,
+    dir: &Path,
+    filter: &Filter,
+    follow: bool,
+) -> Vec<(String, u64, i64)> {
     let rel_of = |p: &Path| {
         p.strip_prefix(root)
             .ok()

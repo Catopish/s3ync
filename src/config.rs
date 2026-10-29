@@ -120,8 +120,8 @@ impl Config {
             if !names.insert(name.clone()) {
                 bail!("duplicate job name {name:?}");
             }
-            if job.mode == Mode::Backup {
-                bail!("job {name:?}: mode = \"backup\" is not implemented yet");
+            if job.mode == Mode::Backup && job.delete {
+                bail!("job {name:?}: delete is not supported for mode = \"backup\"");
             }
             if job.bucket.is_empty() {
                 bail!("job {name:?}: bucket is empty");
@@ -189,13 +189,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_backup_for_now() {
+    fn backup_rejects_delete() {
         let dir = tempfile::tempdir().unwrap();
-        let toml = format!(
-            "[[job]]\nname = \"x\"\nmode = \"backup\"\nbucket = \"b\"\nsource = \"{}\"\n",
-            dir.path().display()
-        );
-        let mut cfg: Config = toml::from_str(&toml).unwrap();
+        let toml = |delete| {
+            format!(
+                "[[job]]\nname = \"x\"\nmode = \"backup\"\nbucket = \"b\"\nsource = \"{}\"\ndelete = {delete}\n",
+                dir.path().display()
+            )
+        };
+        let mut cfg: Config = toml::from_str(&toml(false)).unwrap();
+        cfg.validate().unwrap();
+        let mut cfg: Config = toml::from_str(&toml(true)).unwrap();
         assert!(cfg.validate().is_err());
     }
 }

@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart};
 use tokio::io::AsyncReadExt;
 
 use crate::config::Global;
@@ -58,6 +58,19 @@ impl S3 {
             .map_err(|e| anyhow::anyhow!(e.into_service_error()))
             .with_context(|| format!("cannot list s3://{bucket}/{prefix}"))?;
         Ok(())
+    }
+
+    /// Whether bucket versioning is enabled. Errors if we may not ask (s3:GetBucketVersioning).
+    pub async fn versioning_enabled(&self, bucket: &str) -> Result<bool> {
+        let out = self
+            .client
+            .get_bucket_versioning()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!(e.into_service_error()))
+            .with_context(|| format!("get versioning of bucket {bucket:?}"))?;
+        Ok(out.status() == Some(&BucketVersioningStatus::Enabled))
     }
 
     /// key -> size for every object under `prefix`.

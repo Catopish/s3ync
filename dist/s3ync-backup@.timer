@@ -1,0 +1,13 @@
+[Unit]
+Description=s3ync - scheduled backup of job %i
+
+[Timer]
+# Daily at 02:00. Change per job with: systemctl edit s3ync-backup@<job>.timer
+# (set OnCalendar= to empty first, then the new value). See `man systemd.time`.
+OnCalendar=*-*-* 02:00:00
+# Run at boot if a scheduled run was missed while the machine was off.
+Persistent=true
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target
