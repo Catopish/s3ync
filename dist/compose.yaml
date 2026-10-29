@@ -2,6 +2,7 @@
 #   docker compose -f dist/compose.yaml up -d --build
 #   docker compose -f dist/compose.yaml exec s3ync s3ync status
 #   docker compose -f dist/compose.yaml run --rm s3ync backup --job db-dumps   # one-off
+#   docker compose -f dist/compose.yaml run --rm -v /tmp/r:/restore s3ync restore --job db-dumps --to /restore
 services:
   s3ync:
     build: ..
@@ -12,6 +13,8 @@ services:
     volumes:
       - /etc/s3ync/config.toml:/etc/s3ync/config.toml:ro
       - s3ync-state:/var/lib/s3ync
+      # With [encryption] and no recipients, the identity file must be mounted too:
+      # - /etc/s3ync/age.key:/etc/s3ync/age.key:ro
       # Mount every job's `source` at the same path it has in config.toml:
       - /home/me/photos:/home/me/photos:ro
       - /var/backups/db:/var/backups/db:ro

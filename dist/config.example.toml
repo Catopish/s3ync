@@ -7,6 +7,19 @@ multipart_threshold_mb = 16
 part_size_mb = 16                # >= 5
 force_path_style = false         # true for MinIO / SeaweedFS / most S3-compatible stores
 
+# Client-side encryption with age (https://age-encryption.org), off by default.
+# Objects are encrypted before upload; synced files get a `.age` suffix, backups end in
+# `.tar.zst.age`. Restore with `s3ync restore --job NAME --to DIR [-i PRIVATE_KEY]`.
+# [encryption]
+# type       = "age"
+# recipients = [                   # public keys to encrypt to; list a spare key too
+#   "~/.ssh/id_ed25519.pub",       # ssh-ed25519 / ssh-rsa public key file (~ = service user's home)
+#   "age1...",                     # an age public key, e.g. from `s3ync keygen -o spare.key`
+# ]
+# identity   = "/etc/s3ync/age.key"  # private key for restore; with no recipients, data is
+#                                    # encrypted to it. Create with `s3ync keygen`, then copy
+#                                    # it OFF this machine: no key, no restore.
+
 [[job]]
 name    = "photos"               # unique key: [A-Za-z0-9_-]
 mode    = "sync"
@@ -17,6 +30,7 @@ delete  = false                  # also delete from S3 when deleted locally
 exclude = ["*.tmp", "*.swp", ".git/", "**/node_modules/"]
 debounce_ms = 3000
 follow_symlinks = false
+# encrypt = false                  # opt this job out of [encryption]
 
 # Backup: packs `source` into s3://<bucket>/<prefix><name>.tar.zst.
 # Taken by the daemon on `schedule`, or any time with `s3ync backup --job db-dumps`.

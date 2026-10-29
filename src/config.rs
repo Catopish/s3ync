@@ -11,8 +11,39 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default)]
     pub global: Global,
+    #[serde(default)]
+    pub encryption: Encryption,
     #[serde(rename = "job", default)]
     pub jobs: Vec<Job>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EncryptionType {
+    #[default]
+    None,
+    Age,
+}
+
+/// Client-side encryption, applied to every job unless it sets `encrypt = false`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Encryption {
+    #[serde(rename = "type", default)]
+    pub kind: EncryptionType,
+    /// Public keys to encrypt to: `age1...`, `ssh-ed25519 ...`/`ssh-rsa ...`, or paths to
+    /// files holding such keys (e.g. `~/.ssh/id_ed25519.pub`).
+    #[serde(default)]
+    pub recipients: Vec<String>,
+    /// Private key for `s3ync restore` (age identity file or SSH private key). When
+    /// `recipients` is empty, new objects are encrypted to this key's public key.
+    pub identity: Option<PathBuf>,
+}
+
+impl Encryption {
+    pub fn enabled(&self) -> bool {
+        self.kind != EncryptionType::None
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,7 +121,19 @@ pub struct Job {
     pub schedule: Option<String>,
     #[serde(skip)]
     pub cron: Option<Cron>,
+    /// Set to false to opt this job out of `[encryption]`.
+    #[serde(default = "yes")]
+    pub encrypt: bool,
+    /// Whether new objects of this job are encrypted (`[encryption]` on and `encrypt`).
+    #[serde(skip)]
+    pub encrypted: bool,
 }
+
+fn yes() -> bool {
+    true
+}
+
+pub const ENCRYPTED_SUFFIX: &str = ".age";
 
 fn default_debounce_ms() -> u64 {
     3000
@@ -105,19 +148,31 @@ impl Job {
     pub fn key_for(&self, rel: &str) -> String {
         format!("{}{}", self.prefix, rel)
     }
+
+    /// S3 key of a synced file: `key_for(rel)`, plus `.age` when encrypted.
+    pub fn object_key(&self, rel: &str) -> String {
+        let key = self.key_for(rel);
+        if self.encrypted {
+            key + ENCRYPTED_SUFFIX
+        } else {
+            key
+        }
+    }
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Self> {
+    /// `check_sources`: require every job's `source` to exist. Off for commands that
+    /// don't read them (restore on a fresh machine, keygen, status).
+    pub fn load(path: &Path, check_sources: bool) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
         let mut cfg: Config =
             toml::from_str(&raw).with_context(|| format!("parsing config {}", path.display()))?;
-        cfg.validate()?;
+        cfg.validate(check_sources)?;
         Ok(cfg)
     }
 
-    fn validate(&mut self) -> Result<()> {
+    fn validate(&mut self, check_sources: bool) -> Result<()> {
         if self.jobs.is_empty() {
             bail!("no [[job]] entries in config");
         }
@@ -128,6 +183,19 @@ impl Config {
         if self.global.part_size_mb < 5 {
             bail!("global.part_size_mb must be at least 5");
         }
+
+        let enc = &mut self.encryption;
+        if enc.enabled() && enc.recipients.is_empty() && enc.identity.is_none() {
+            bail!("encryption: set recipients (public keys), or identity (see `s3ync keygen`)");
+        }
+        if !enc.enabled() && (!enc.recipients.is_empty() || enc.identity.is_some()) {
+            bail!("encryption: recipients/identity set but type is not \"age\"");
+        }
+        enc.identity = enc
+            .identity
+            .take()
+            .map(|p| crate::crypto::expand_tilde(&p.to_string_lossy()));
+        let encryption_on = enc.enabled();
 
         let mut names = HashSet::new();
         for job in &mut self.jobs {
@@ -175,7 +243,8 @@ impl Config {
             if !job.source.is_absolute() {
                 bail!("job {name:?}: source must be an absolute path");
             }
-            if !job.source.is_dir() {
+            job.encrypted = encryption_on && job.encrypt;
+            if check_sources && !job.source.is_dir() {
                 bail!(
                     "job {name:?}: source {} is not a directory",
                     job.source.display()
@@ -228,7 +297,7 @@ mod tests {
             dir.path().display()
         );
         let mut cfg: Config = toml::from_str(&toml).unwrap();
-        cfg.validate().unwrap();
+        cfg.validate(true).unwrap();
         assert_eq!(cfg.jobs[0].prefix, "photos/");
         assert_eq!(cfg.jobs[0].key_for("a/b.jpg"), "photos/a/b.jpg");
         assert_eq!(cfg.global.concurrency, 4);
@@ -244,9 +313,9 @@ mod tests {
             )
         };
         let mut cfg: Config = toml::from_str(&toml(false)).unwrap();
-        cfg.validate().unwrap();
+        cfg.validate(true).unwrap();
         let mut cfg: Config = toml::from_str(&toml(true)).unwrap();
-        assert!(cfg.validate().is_err());
+        assert!(cfg.validate(true).is_err());
     }
 
     #[test]
@@ -260,7 +329,7 @@ mod tests {
         };
         let ok = |mode, extra| {
             let mut cfg: Config = toml::from_str(&toml(mode, extra)).unwrap();
-            cfg.validate().is_ok()
+            cfg.validate(true).is_ok()
         };
         assert!(ok("backup", "naming = \"timestamp\"\nkeep_last = 7"));
         assert!(ok("backup", "naming = \"timestamp\""));
@@ -270,5 +339,48 @@ mod tests {
         assert!(!ok("backup", "schedule = \"0 25 * * *\""));
         assert!(!ok("backup", "schedule = \"0 0 30 2 *\""));
         assert!(!ok("sync", "schedule = \"0 2 * * *\""));
+    }
+
+    #[test]
+    fn encryption_per_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let toml = format!(
+            r#"
+            [encryption]
+            type = "age"
+            identity = "/nonexistent/age.key"
+
+            [[job]]
+            name = "a"
+            mode = "sync"
+            bucket = "b"
+            source = "{0}"
+
+            [[job]]
+            name = "b"
+            mode = "sync"
+            bucket = "b"
+            source = "{0}"
+            encrypt = false
+            "#,
+            dir.path().display()
+        );
+        let mut cfg: Config = toml::from_str(&toml).unwrap();
+        cfg.validate(true).unwrap();
+        assert_eq!(cfg.jobs[0].object_key("x/y.txt"), "x/y.txt.age");
+        assert_eq!(cfg.jobs[1].object_key("x/y.txt"), "x/y.txt");
+
+        let mut cfg: Config =
+            toml::from_str(&toml.replace("identity = \"/nonexistent/age.key\"", "")).unwrap();
+        assert!(cfg.validate(true).is_err(), "age without keys");
+    }
+
+    #[test]
+    fn sources_optional_for_restore() {
+        let toml = "[[job]]\nname = \"x\"\nmode = \"sync\"\nbucket = \"b\"\nsource = \"/nonexistent/dir\"\n";
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        assert!(cfg.validate(true).is_err());
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate(false).unwrap();
     }
 }

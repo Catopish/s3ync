@@ -6,12 +6,21 @@ use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::config::Global;
 
 /// Object metadata key holding the BLAKE3 hex hash of the uploaded content.
+/// Not set on encrypted objects: a plaintext hash would let anyone with bucket access
+/// confirm guesses about the content.
 const HASH_META: &str = "s3ync-hash";
+
+pub struct Version {
+    pub id: String,
+    pub modified_unix: i64,
+    pub size: u64,
+    pub latest: bool,
+}
 
 #[derive(Clone)]
 pub struct S3 {
@@ -124,7 +133,7 @@ impl S3 {
         key: &str,
         path: &Path,
         size: u64,
-        hash: &str,
+        hash: Option<&str>,
     ) -> Result<()> {
         if size >= self.multipart_threshold {
             return self.upload_multipart(bucket, key, path, hash).await;
@@ -136,7 +145,7 @@ impl S3 {
             .put_object()
             .bucket(bucket)
             .key(key)
-            .metadata(HASH_META, hash)
+            .set_metadata(hash.map(|h| [(HASH_META.to_string(), h.to_string())].into()))
             .body(body)
             .send()
             .await
@@ -150,14 +159,14 @@ impl S3 {
         bucket: &str,
         key: &str,
         path: &Path,
-        hash: &str,
+        hash: Option<&str>,
     ) -> Result<()> {
         let created = self
             .client
             .create_multipart_upload()
             .bucket(bucket)
             .key(key)
-            .metadata(HASH_META, hash)
+            .set_metadata(hash.map(|h| [(HASH_META.to_string(), h.to_string())].into()))
             .send()
             .await
             .map_err(|e| anyhow::anyhow!(e.into_service_error()))
@@ -246,6 +255,91 @@ impl S3 {
             part_number += 1;
         }
         Ok(parts)
+    }
+
+    pub async fn exists(&self, bucket: &str, key: &str) -> Result<bool> {
+        match self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                let e = e.into_service_error();
+                if e.is_not_found() {
+                    Ok(false)
+                } else {
+                    Err(anyhow::anyhow!(e)).with_context(|| format!("head s3://{bucket}/{key}"))
+                }
+            }
+        }
+    }
+
+    /// Streams an object (or one version of it) into `dst`; returns its s3ync hash, if any.
+    pub async fn download(
+        &self,
+        bucket: &str,
+        key: &str,
+        version: Option<&str>,
+        dst: &mut tokio::fs::File,
+    ) -> Result<Option<String>> {
+        let out = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .set_version_id(version.map(str::to_string))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!(e.into_service_error()))
+            .with_context(|| format!("get s3://{bucket}/{key}"))?;
+        let hash = out.metadata().and_then(|m| m.get(HASH_META)).cloned();
+        let mut body = out.body.into_async_read();
+        tokio::io::copy(&mut body, dst)
+            .await
+            .with_context(|| format!("downloading s3://{bucket}/{key}"))?;
+        dst.flush().await?;
+        Ok(hash)
+    }
+
+    /// Versions of exactly `key`, newest first. Needs s3:ListBucketVersions.
+    pub async fn versions(&self, bucket: &str, key: &str) -> Result<Vec<Version>> {
+        let mut out = Vec::new();
+        let (mut key_marker, mut version_marker) = (None, None);
+        loop {
+            let page = self
+                .client
+                .list_object_versions()
+                .bucket(bucket)
+                .prefix(key)
+                .set_key_marker(key_marker.take())
+                .set_version_id_marker(version_marker.take())
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!(e.into_service_error()))
+                .with_context(|| format!("listing versions of s3://{bucket}/{key}"))?;
+            for v in page.versions() {
+                if v.key() != Some(key) {
+                    continue;
+                }
+                out.push(Version {
+                    id: v.version_id().unwrap_or("null").to_string(),
+                    modified_unix: v.last_modified().map(|t| t.secs()).unwrap_or(0),
+                    size: v.size().unwrap_or(0).max(0) as u64,
+                    latest: v.is_latest().unwrap_or(false),
+                });
+            }
+            if page.is_truncated() != Some(true) {
+                break;
+            }
+            key_marker = page.next_key_marker().map(str::to_string);
+            version_marker = page.next_version_id_marker().map(str::to_string);
+        }
+        out.sort_by_key(|v| std::cmp::Reverse(v.modified_unix));
+        Ok(out)
     }
 
     pub async fn delete(&self, bucket: &str, key: &str) -> Result<()> {

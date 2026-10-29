@@ -5,13 +5,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::config::{Job, Naming};
+use crate::config::{ENCRYPTED_SUFFIX, Job, Naming};
+use crate::crypto::Crypto;
 use crate::filter::Filter;
 use crate::s3::S3;
 use crate::sync::{JobStatus, mtime_ns, unix_now, walk};
@@ -19,8 +21,20 @@ use crate::sync::{JobStatus, mtime_ns, unix_now, walk};
 const ZSTD_LEVEL: i32 = 3;
 const RETRY_BASE: Duration = Duration::from_secs(60);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(3600);
-/// When each backup job last succeeded (unix secs), so a restarted daemon catches up.
+/// Last successful run per job, so a restarted daemon catches up on a missed run and
+/// encrypted backups (whose objects carry no hash) can still skip unchanged uploads.
 const LAST_RUN_FILE: &str = "backups.json";
+const ARCHIVE_EXT: &str = ".tar.zst";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LastRun {
+    pub at: u64,
+    /// Hash of the archive's tar stream and the key it is stored at.
+    #[serde(default)]
+    pub hash: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+}
 
 /// Takes the job's backups on its `schedule` until `shutdown`. A run missed while the
 /// daemon was down happens right away; a failed run is retried with backoff until the
@@ -28,6 +42,7 @@ const LAST_RUN_FILE: &str = "backups.json";
 pub async fn run_scheduled(
     job: Job,
     s3: S3,
+    crypto: Option<Arc<Crypto>>,
     state_dir: PathBuf,
     sem: Arc<Semaphore>,
     status: Arc<Mutex<JobStatus>>,
@@ -38,8 +53,7 @@ pub async fn run_scheduled(
         .clone()
         .expect("only jobs with a schedule are scheduled");
     let next_after = |t: DateTime<Local>| cron.find_next_occurrence(&t, false);
-    let tmp = tmp_dir(&state_dir);
-    let mut last = last_runs(&state_dir).get(&job.name).copied();
+    let mut last = last_runs(&state_dir).get(&job.name).map(|r| r.at);
     status.lock().unwrap().last_backup_unix = last;
     let mut failures = 0u32;
 
@@ -75,9 +89,8 @@ pub async fn run_scheduled(
             p = sem.acquire() => p.expect("semaphore closed"),
             _ = shutdown.cancelled() => return,
         };
-        let started = unix_now();
         let res = tokio::select! {
-            r = run(&job, &s3, &tmp) => r,
+            r = run(&job, &s3, crypto.clone(), &state_dir) => r,
             _ = shutdown.cancelled() => {
                 warn!(job = %job.name, "backup interrupted by shutdown");
                 return;
@@ -87,15 +100,12 @@ pub async fn run_scheduled(
         match res {
             Ok(r) => {
                 failures = 0;
-                last = Some(started);
+                last = Some(r.at);
                 st.last_backup_unix = last;
                 st.uploaded += u64::from(r.uploaded);
                 st.deleted += r.pruned as u64;
                 if r.unreadable > 0 {
                     st.last_error = Some(format!("{} unreadable files left out", r.unreadable));
-                }
-                if let Err(e) = record_success(&state_dir, &job.name, started) {
-                    warn!(job = %job.name, "{e:#}");
                 }
             }
             Err(e) => {
@@ -112,16 +122,16 @@ fn local_time(unix: u64) -> Option<DateTime<Local>> {
     DateTime::from_timestamp(unix as i64, 0).map(|t| t.with_timezone(&Local))
 }
 
-pub fn last_runs(state_dir: &Path) -> HashMap<String, u64> {
+fn last_runs(state_dir: &Path) -> HashMap<String, LastRun> {
     std::fs::read(state_dir.join(LAST_RUN_FILE))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
-pub fn record_success(state_dir: &Path, job: &str, at: u64) -> Result<()> {
+fn record_success(state_dir: &Path, job: &str, run: LastRun) -> Result<()> {
     let mut runs = last_runs(state_dir);
-    runs.insert(job.to_string(), at);
+    runs.insert(job.to_string(), run);
     // Per-process temp name: `s3ync backup` may run next to the daemon.
     let tmp = state_dir.join(format!("{LAST_RUN_FILE}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, serde_json::to_vec_pretty(&runs)?)
@@ -131,6 +141,8 @@ pub fn record_success(state_dir: &Path, job: &str, at: u64) -> Result<()> {
 
 #[derive(Debug)]
 pub struct Report {
+    /// When the run started (unix secs).
+    pub at: u64,
     pub key: String,
     pub files: usize,
     /// Compressed archive size.
@@ -142,10 +154,25 @@ pub struct Report {
     pub pruned: usize,
 }
 
-/// Archives the job's source and uploads it, unless the latest backup in S3 has the same
-/// content hash. With `Naming::Fixed` history is left to bucket versioning, with
-/// `Naming::Timestamp` every upload gets its own key and `keep_last` prunes old ones.
-pub async fn run(job: &Job, s3: &S3, tmp_dir: &Path) -> Result<Report> {
+/// Archives the job's source and uploads it, unless the latest backup is identical.
+/// With `Naming::Fixed` history is left to bucket versioning, with `Naming::Timestamp`
+/// every upload gets its own key and `keep_last` prunes old ones. Encrypted jobs need
+/// `crypto`. Records the run in `state_dir`.
+pub async fn run(
+    job: &Job,
+    s3: &S3,
+    crypto: Option<Arc<Crypto>>,
+    state_dir: &Path,
+) -> Result<Report> {
+    let at = unix_now();
+    let crypto = crypto.filter(|_| job.encrypted);
+    if job.encrypted && crypto.is_none() {
+        bail!(
+            "job {:?} is encrypted but no encryption keys are loaded",
+            job.name
+        );
+    }
+    let ext = archive_ext(job);
     let (key, previous) = match job.naming {
         Naming::Fixed => {
             match s3.versioning_enabled(&job.bucket).await {
@@ -160,31 +187,39 @@ pub async fn run(job: &Job, s3: &S3, tmp_dir: &Path) -> Result<Report> {
                      replaces the previous one, consider naming = \"timestamp\""
                 ),
             }
-            let key = job.key_for(&format!("{}.tar.zst", job.name));
+            let key = job.key_for(&format!("{}{ext}", job.name));
             (key.clone(), Some(key))
         }
         Naming::Timestamp => {
-            let key = job.key_for(&format!("{0}/{0}-{1}.tar.zst", job.name, stamp(unix_now())));
+            let key = job.key_for(&format!("{0}/{0}-{1}{ext}", job.name, stamp(at)));
             (key, timestamped(job, s3).await?.pop())
         }
     };
 
-    std::fs::create_dir_all(tmp_dir).with_context(|| format!("creating {}", tmp_dir.display()))?;
+    let tmp_dir = tmp_dir(state_dir);
+    std::fs::create_dir_all(&tmp_dir).with_context(|| format!("creating {}", tmp_dir.display()))?;
     let tmp = tempfile::Builder::new()
         .prefix(&format!("backup-{}-", job.name))
-        .suffix(".tar.zst.tmp")
-        .tempfile_in(tmp_dir)
+        .suffix(".tmp")
+        .tempfile_in(&tmp_dir)
         .with_context(|| format!("creating temp file in {}", tmp_dir.display()))?;
 
     let archive = {
-        let (job, file) = (job.clone(), tmp.reopen()?);
-        tokio::task::spawn_blocking(move || build(&job, file)).await??
+        let (job, file, crypto) = (job.clone(), tmp.reopen()?, crypto.clone());
+        tokio::task::spawn_blocking(move || build(&job, file, crypto.as_deref())).await??
     };
     let hex = archive.hash.to_hex().to_string();
     let size = tmp.as_file().metadata()?.len();
     info!(job = %job.name, files = archive.files, size, "archive built");
 
     let unchanged = match &previous {
+        // Encrypted objects carry no hash: compare with what this machine last uploaded.
+        Some(prev) if crypto.is_some() => {
+            let last = last_runs(state_dir).remove(&job.name).unwrap_or_default();
+            last.hash.as_deref() == Some(hex.as_str())
+                && last.key.as_deref() == Some(prev.as_str())
+                && s3.exists(&job.bucket, prev).await?
+        }
         Some(prev) => s3.remote_hash(&job.bucket, prev).await?.as_deref() == Some(hex.as_str()),
         None => false,
     };
@@ -193,10 +228,20 @@ pub async fn run(job: &Job, s3: &S3, tmp_dir: &Path) -> Result<Report> {
         info!(job = %job.name, key = %prev, "unchanged since last backup, not uploaded");
         prev
     } else {
-        s3.upload(&job.bucket, &key, tmp.path(), size, &hex).await?;
+        let meta_hash = crypto.is_none().then_some(hex.as_str());
+        s3.upload(&job.bucket, &key, tmp.path(), size, meta_hash)
+            .await?;
         info!(job = %job.name, key = %key, "backup uploaded");
         key
     };
+    let run = LastRun {
+        at,
+        hash: Some(hex),
+        key: Some(key.clone()),
+    };
+    if let Err(e) = record_success(state_dir, &job.name, run) {
+        warn!(job = %job.name, "{e:#}");
+    }
 
     let mut pruned = 0;
     if job.naming == Naming::Timestamp && job.keep_last > 0 {
@@ -210,6 +255,7 @@ pub async fn run(job: &Job, s3: &S3, tmp_dir: &Path) -> Result<Report> {
     }
 
     Ok(Report {
+        at,
         key,
         files: archive.files,
         size,
@@ -219,9 +265,23 @@ pub async fn run(job: &Job, s3: &S3, tmp_dir: &Path) -> Result<Report> {
     })
 }
 
-/// Keys of the job's timestamped backups, oldest first. Anything else under the
-/// job's folder is ignored, so it is never picked as "latest" nor pruned.
-async fn timestamped(job: &Job, s3: &S3) -> Result<Vec<String>> {
+fn archive_ext(job: &Job) -> String {
+    if job.encrypted {
+        format!("{ARCHIVE_EXT}{ENCRYPTED_SUFFIX}")
+    } else {
+        ARCHIVE_EXT.to_string()
+    }
+}
+
+/// Keys the job's fixed-name backup may be stored at (plain, encrypted).
+pub fn fixed_keys(job: &Job) -> [String; 2] {
+    let k = job.key_for(&format!("{}{ARCHIVE_EXT}", job.name));
+    [k.clone(), k + ENCRYPTED_SUFFIX]
+}
+
+/// Keys of the job's timestamped backups (plain or encrypted), oldest first. Anything
+/// else under the job's folder is ignored, so it is never picked as "latest" nor pruned.
+pub async fn timestamped(job: &Job, s3: &S3) -> Result<Vec<String>> {
     let dir = job.key_for(&format!("{}/", job.name));
     let lead = format!("{}-", job.name);
     let mut keys: Vec<String> = s3
@@ -229,14 +289,15 @@ async fn timestamped(job: &Job, s3: &S3) -> Result<Vec<String>> {
         .await?
         .into_keys()
         .filter(|k| {
-            k[dir.len()..]
-                .strip_prefix(&lead)
-                .and_then(|r| r.strip_suffix(".tar.zst"))
+            let r = &k[dir.len()..];
+            r.strip_prefix(&lead)
+                .map(|r| r.strip_suffix(ENCRYPTED_SUFFIX).unwrap_or(r))
+                .and_then(|r| r.strip_suffix(ARCHIVE_EXT))
                 .is_some_and(is_stamp)
         })
         .collect();
     // The stamp is fixed-width and most-significant first, so this is chronological.
-    keys.sort_unstable();
+    keys.sort_unstable_by(|a, b| stamp_of(a).cmp(stamp_of(b)).then(a.cmp(b)));
     Ok(keys)
 }
 
@@ -261,6 +322,16 @@ fn stamp(unix: u64) -> String {
     )
 }
 
+/// The `YYYY-...Z` part of a timestamped backup key.
+pub fn stamp_of(key: &str) -> &str {
+    let name = key.rsplit('/').next().unwrap_or(key);
+    let name = name.strip_suffix(ENCRYPTED_SUFFIX).unwrap_or(name);
+    let name = name.strip_suffix(ARCHIVE_EXT).unwrap_or(name);
+    &name[name.len().saturating_sub(STAMP_LEN)..]
+}
+
+const STAMP_LEN: usize = 20;
+
 fn is_stamp(s: &str) -> bool {
     const SHAPE: &[u8] = b"0000-00-00T00-00-00Z";
     s.len() == SHAPE.len()
@@ -281,13 +352,49 @@ struct Archive {
     unreadable: usize,
 }
 
-fn build(job: &Job, out: File) -> Result<Archive> {
+/// The archive file, optionally behind age encryption.
+enum Sink {
+    Plain(File),
+    Age(age::stream::StreamWriter<File>),
+}
+
+impl Sink {
+    fn finish(self) -> io::Result<File> {
+        match self {
+            Sink::Plain(f) => Ok(f),
+            Sink::Age(w) => w.finish(),
+        }
+    }
+}
+
+impl Write for Sink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Sink::Plain(f) => f.write(buf),
+            Sink::Age(w) => w.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Sink::Plain(f) => f.flush(),
+            Sink::Age(w) => w.flush(),
+        }
+    }
+}
+
+/// tar -> (hash) -> zstd -> [age] -> `out`
+fn build(job: &Job, out: File, crypto: Option<&Crypto>) -> Result<Archive> {
     let filter = Filter::new(&job.exclude)?;
     let mut files = walk(&job.source, &job.source, &filter, job.follow_symlinks);
     // Stable order, so unchanged content gives an identical archive.
     files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-    let enc = zstd::Encoder::new(out, ZSTD_LEVEL)?;
+    let sink = match crypto {
+        Some(c) => Sink::Age(c.encrypt_to(out)?),
+        None => Sink::Plain(out),
+    };
+    let enc = zstd::Encoder::new(sink, ZSTD_LEVEL)?;
     let mut tar = tar::Builder::new(HashWriter {
         inner: enc,
         hasher: blake3::Hasher::new(),
@@ -307,6 +414,7 @@ fn build(job: &Job, out: File) -> Result<Archive> {
     let w = tar.into_inner().context("finishing tar")?;
     w.inner
         .finish()
+        .and_then(Sink::finish)
         .and_then(|f| f.sync_all())
         .context("finishing archive")?;
     Ok(Archive {
@@ -377,6 +485,8 @@ mod tests {
             keep_last: 0,
             schedule: None,
             cron: None,
+            encrypt: true,
+            encrypted: false,
         }
     }
 
@@ -393,7 +503,7 @@ mod tests {
 
     fn archive(job: &Job) -> (Archive, Vec<u8>) {
         let out = tempfile::tempfile().unwrap();
-        let a = build(job, out.try_clone().unwrap()).unwrap();
+        let a = build(job, out.try_clone().unwrap(), None).unwrap();
         let mut bytes = Vec::new();
         let mut out = out;
         io::Seek::rewind(&mut out).unwrap();

@@ -7,6 +7,7 @@ license = "GPL-3.0-only"
 repository = "https://github.com/Catopish/s3ync"
 
 [dependencies]
+age = { version = "0.12.1", features = ["ssh"] }
 anyhow = "1.0.104"
 aws-config = { version = "1.13.0", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1.155.0"
@@ -20,6 +21,7 @@ globset = "0.4.20"
 notify = "8.2.0"
 notify-debouncer-full = "0.7.0"
 redb = "4.4.0"
+rpassword = "7.5.4"
 sd-notify = "0.5.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

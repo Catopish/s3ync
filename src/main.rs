@@ -1,6 +1,8 @@
 mod backup;
 mod config;
+mod crypto;
 mod filter;
+mod restore;
 mod s3;
 mod state;
 mod sync;
@@ -19,23 +21,48 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use config::{Config, Mode, Naming};
+use crypto::Crypto;
 use s3::S3;
 use state::State;
 use sync::{JobCtx, JobStatus};
 
+const EXAMPLES: &str = "\
+Examples:
+  s3ync check                                   validate config.toml, test bucket access
+  s3ync run                                     daemon: live sync + scheduled backups
+  s3ync backup --job db-dumps                   take one backup now
+  s3ync keygen                                  create the age key for [encryption]
+  s3ync restore --job db-dumps --list           show available backups
+  s3ync restore --job db-dumps --to /tmp/db     restore the latest backup
+  s3ync restore --job photos --to /tmp/p -i ~/.ssh/id_ed25519
+
+Config: /etc/s3ync/config.toml (see dist/config.example.toml).
+Credentials: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, AWS_ENDPOINT_URL
+from the environment or the --env file. Logging: S3YNC_LOG=s3ync=debug.";
+
 #[derive(Parser)]
-#[command(version, about = "Sync local directories to S3")]
+#[command(
+    version,
+    about = "Sync directories to S3 and take scheduled, optionally encrypted backups",
+    long_about = "Sync directories to S3 and take scheduled, optionally encrypted backups.\n\n\
+        Everything is configured in one config.toml: sync jobs are watched and uploaded \
+        within seconds, backup jobs are packed into .tar.zst archives on their cron \
+        schedule. With [encryption] type = \"age\", objects are encrypted before upload.",
+    after_help = EXAMPLES
+)]
 struct Cli {
+    /// Config file
     #[arg(
         long,
         short,
         env = "S3YNC_CONFIG",
         default_value = "/etc/s3ync/config.toml",
+        value_name = "FILE",
         global = true
     )]
     config: PathBuf,
-    /// .env file with AWS credentials. Defaults to ./.env if present.
-    #[arg(long, env = "S3YNC_ENV", global = true)]
+    /// .env file with AWS credentials [default: ./.env if present]
+    #[arg(long, env = "S3YNC_ENV", value_name = "FILE", global = true)]
     env: Option<PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
@@ -43,23 +70,85 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run the daemon (watch and sync continuously).
+    /// Run the daemon: live sync and scheduled backups until SIGTERM
+    #[command(long_about = "Run the daemon until SIGTERM.\n\n\
+        Sync jobs: watch the source and upload changes within seconds, with a full \
+        re-check on startup and every global.rescan_interval_secs.\n\
+        Backup jobs with a `schedule`: take a backup at each cron time; a run missed \
+        while the daemon was down happens right after startup.")]
     Run,
-    /// Validate the config and check bucket access.
+    /// Validate the config, check bucket access and encryption keys
     Check,
-    /// Do a single reconcile pass and exit.
+    /// One sync pass for sync jobs, then exit (non-zero if anything failed)
     Once {
-        /// Only this job.
-        #[arg(long)]
+        /// Only this job
+        #[arg(long, value_name = "NAME")]
         job: Option<String>,
     },
-    /// Show per-job status of the running daemon.
+    /// Show per-job status of the running daemon
     Status,
-    /// Archive backup jobs and upload them (meant for a timer or cron).
+    /// Take backups now, then exit (non-zero if any failed)
+    #[command(
+        long_about = "Take backups now, then exit (non-zero if any failed).\n\n\
+        Packs each backup job's source into a .tar.zst archive (encrypted to .tar.zst.age \
+        with [encryption]) and uploads it, unless nothing changed since the last backup."
+    )]
     Backup {
-        /// Only this job.
-        #[arg(long)]
+        /// Only this job [default: all backup jobs]
+        #[arg(long, value_name = "NAME")]
         job: Option<String>,
+    },
+    /// Restore a backup, or a sync job's files, from S3
+    #[command(
+        long_about = "Restore from S3 into a local directory.\n\n\
+            Backup jobs: unpacks the latest backup, or the one picked with --at / \
+            --version-id (see --list).\n\
+            Sync jobs: downloads every file, or only those under --path.\n\n\
+            Encrypted objects are recognized by content and decrypted with --identity \
+            (or encryption.identity from the config). The source directories in the \
+            config need not exist, so this works on a fresh machine.",
+        after_help = "Examples:\n  \
+            s3ync restore --job db-dumps --list\n  \
+            s3ync restore --job db-dumps --to /tmp/db --at 2026-10-29\n  \
+            s3ync restore --job photos --to /tmp/photos --path 2024/summer -i ~/.ssh/id_ed25519"
+    )]
+    Restore {
+        /// Job to restore (bucket, prefix and kind come from the config)
+        #[arg(long, value_name = "NAME")]
+        job: String,
+        /// Directory to restore into; created if missing, must be empty unless --force
+        #[arg(long, value_name = "DIR", required_unless_present = "list")]
+        to: Option<PathBuf>,
+        /// Private key for encrypted objects: age identity file or SSH private key
+        /// [default: encryption.identity]. Passphrase: prompted, or S3YNC_PASSPHRASE
+        #[arg(long, short, env = "S3YNC_IDENTITY", value_name = "FILE")]
+        identity: Option<PathBuf>,
+        /// List available backups instead of restoring (backup jobs)
+        #[arg(long)]
+        list: bool,
+        /// Timestamped backup to restore: its UTC time or a prefix of it, e.g. 2026-10-29
+        /// for that day's last backup [default: latest]
+        #[arg(long, value_name = "TIME", conflicts_with = "version_id")]
+        at: Option<String>,
+        /// Object version to restore, from --list (naming = "fixed" on a versioned bucket)
+        #[arg(long, value_name = "ID")]
+        version_id: Option<String>,
+        /// Only restore this file or directory (sync jobs)
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+        /// Restore into a non-empty directory, overwriting existing files
+        #[arg(long)]
+        force: bool,
+    },
+    /// Create an age key pair for [encryption]
+    #[command(long_about = "Create an age key pair for [encryption].\n\n\
+        Writes the private key (mode 0600, never overwrites) and prints the public key. \
+        Copy the private key somewhere safe off this machine: without it, nothing \
+        encrypted can be restored.")]
+    Keygen {
+        /// Where to write the private key [default: encryption.identity from the config]
+        #[arg(long, short, value_name = "FILE")]
+        output: Option<PathBuf>,
     },
 }
 
@@ -73,12 +162,28 @@ fn main() -> Result<()> {
             let _ = dotenvy::dotenv();
         }
     }
-    let cfg = Config::load(&cli.config)?;
+    // Commands that don't read the sources must work where they don't exist.
+    let needs_sources = matches!(
+        cli.cmd,
+        Cmd::Run | Cmd::Check | Cmd::Once { .. } | Cmd::Backup { .. }
+    );
+    let cfg = match &cli.cmd {
+        Cmd::Keygen { output: Some(_) } => None,
+        _ => Some(Config::load(&cli.config, needs_sources)?),
+    };
 
+    let level = cfg.as_ref().map_or("info", |c| c.global.log_level.as_str());
     let filter = EnvFilter::try_from_env("S3YNC_LOG")
-        .unwrap_or_else(|_| EnvFilter::new(format!("s3ync={}", cfg.global.log_level)));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+        .unwrap_or_else(|_| EnvFilter::new(format!("s3ync={level}")));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 
+    if let Cmd::Keygen { output } = cli.cmd {
+        return keygen(cfg.as_ref(), output);
+    }
+    let cfg = cfg.expect("loaded above");
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         match cli.cmd {
@@ -87,22 +192,99 @@ fn main() -> Result<()> {
             Cmd::Once { job } => once(cfg, job).await,
             Cmd::Status => status(&cfg),
             Cmd::Backup { job } => backup(cfg, job).await,
+            Cmd::Restore {
+                job,
+                to,
+                identity,
+                list,
+                at,
+                version_id,
+                path,
+                force,
+            } => {
+                let s3 = S3::new(&cfg.global).await?;
+                let opts = restore::Opts {
+                    job,
+                    to,
+                    identity,
+                    list,
+                    at,
+                    version_id,
+                    path,
+                    force,
+                };
+                restore::restore(&cfg, &s3, opts).await
+            }
+            Cmd::Keygen { .. } => unreachable!(),
         }
     })
+}
+
+fn keygen(cfg: Option<&Config>, output: Option<PathBuf>) -> Result<()> {
+    let configured = cfg.and_then(|c| c.encryption.identity.clone());
+    let path = output
+        .or_else(|| configured.clone())
+        .context("no output: pass --output FILE or set encryption.identity in the config")?;
+    let public = crypto::keygen(&path)?;
+    println!("private key: {}", path.display());
+    println!("public key:  {public}");
+    println!(
+        "\nIMPORTANT: copy {} somewhere safe outside this machine (password manager, \
+         offline drive). Without it, encrypted data cannot be restored.",
+        path.display()
+    );
+    if configured.as_deref() != Some(path.as_path()) {
+        println!(
+            "To use it, set encryption.identity = \"{}\", or add the public key to \
+             encryption.recipients.",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Encryption keys, if any job is encrypted.
+fn load_crypto(cfg: &Config) -> Result<Option<Arc<Crypto>>> {
+    if !cfg.jobs.iter().any(|j| j.encrypted) {
+        return Ok(None);
+    }
+    Ok(Crypto::load(&cfg.encryption)?.map(Arc::new))
 }
 
 async fn check(cfg: Config) -> Result<()> {
     let s3 = S3::new(&cfg.global).await?;
     let mut ok = true;
+    match load_crypto(&cfg) {
+        Ok(Some(c)) => {
+            println!(
+                "ok    encryption: age, {} recipient(s)",
+                c.recipient_count()
+            );
+            if let Some(id) = &cfg.encryption.identity
+                && id.exists()
+            {
+                println!(
+                    "      note: keep a copy of {} off this machine, restores need it",
+                    id.display()
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            ok = false;
+            println!("FAIL  encryption: {e:#}");
+        }
+    }
     for job in &cfg.jobs {
         match s3.check(&job.bucket, &job.prefix).await {
             Ok(()) => {
                 println!(
-                    "ok    {:<16} {} -> s3://{}/{}",
+                    "ok    {:<16} {} -> s3://{}/{}{}",
                     job.name,
                     job.source.display(),
                     job.bucket,
-                    job.prefix
+                    job.prefix,
+                    if job.encrypted { "  (encrypted)" } else { "" }
                 );
                 if let Some(cron) = &job.cron
                     && let Ok(next) = cron.find_next_occurrence(&chrono::Local::now(), false)
@@ -135,7 +317,11 @@ async fn check(cfg: Config) -> Result<()> {
     Ok(())
 }
 
-async fn build_jobs(cfg: &Config, only: Option<&str>) -> Result<Vec<Arc<JobCtx>>> {
+async fn build_jobs(
+    cfg: &Config,
+    crypto: Option<Arc<Crypto>>,
+    only: Option<&str>,
+) -> Result<Vec<Arc<JobCtx>>> {
     let s3 = S3::new(&cfg.global).await?;
     let state = State::open(&cfg.global.state_dir)?;
     let mut out = Vec::new();
@@ -150,6 +336,8 @@ async fn build_jobs(cfg: &Config, only: Option<&str>) -> Result<Vec<Arc<JobCtx>>
             job.clone(),
             s3.clone(),
             state.clone(),
+            crypto.clone(),
+            backup::tmp_dir(&cfg.global.state_dir),
         )?));
     }
     if let Some(n) = only
@@ -161,7 +349,7 @@ async fn build_jobs(cfg: &Config, only: Option<&str>) -> Result<Vec<Arc<JobCtx>>
 }
 
 async fn once(cfg: Config, only: Option<String>) -> Result<()> {
-    let jobs = build_jobs(&cfg, only.as_deref()).await?;
+    let jobs = build_jobs(&cfg, load_crypto(&cfg)?, only.as_deref()).await?;
     let mut failed = 0;
     for ctx in jobs {
         let (ok, bad) = sync::run_once(ctx.clone(), cfg.global.concurrency).await?;
@@ -191,15 +379,11 @@ async fn backup(cfg: Config, only: Option<String>) -> Result<()> {
         }
     }
     let s3 = S3::new(&cfg.global).await?;
-    let tmp = backup::tmp_dir(&cfg.global.state_dir);
+    let crypto = load_crypto(&cfg)?;
     let mut failed = 0;
     for job in jobs {
-        let started = sync::unix_now();
-        match backup::run(job, &s3, &tmp).await {
+        match backup::run(job, &s3, crypto.clone(), &cfg.global.state_dir).await {
             Ok(r) => {
-                if let Err(e) = backup::record_success(&cfg.global.state_dir, &job.name, started) {
-                    warn!(job = %job.name, "{e:#}");
-                }
                 println!(
                     "{}: {} files, {:.1} MiB -> s3://{}/{} ({})",
                     job.name,
@@ -230,7 +414,8 @@ async fn backup(cfg: Config, only: Option<String>) -> Result<()> {
 }
 
 async fn run(cfg: Config) -> Result<()> {
-    let jobs = build_jobs(&cfg, None).await?;
+    let crypto = load_crypto(&cfg)?;
+    let jobs = build_jobs(&cfg, crypto.clone(), None).await?;
     let scheduled: Vec<_> = cfg.jobs.iter().filter(|j| j.cron.is_some()).collect();
     if jobs.is_empty() && scheduled.is_empty() {
         bail!("nothing to run: no sync jobs and no backup jobs with a schedule");
@@ -280,6 +465,7 @@ async fn run(cfg: Config) -> Result<()> {
                 let fut = backup::run_scheduled(
                     job.clone(),
                     s3.clone(),
+                    crypto.clone(),
                     cfg.global.state_dir.clone(),
                     sem.clone(),
                     status,

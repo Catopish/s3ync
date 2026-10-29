@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::config::Job;
+use crate::crypto::Crypto;
 use crate::filter::Filter;
 use crate::s3::S3;
 use crate::state::{Entry, State};
@@ -28,6 +29,9 @@ pub struct JobCtx {
     filter: Filter,
     s3: S3,
     state: State,
+    /// Set when the job is encrypted; files are encrypted into `tmp_dir` before upload.
+    crypto: Option<Arc<Crypto>>,
+    tmp_dir: PathBuf,
     pub status: Arc<Mutex<JobStatus>>,
 }
 
@@ -70,13 +74,22 @@ enum Work {
 }
 
 impl JobCtx {
-    pub fn new(job: Job, s3: S3, state: State) -> Result<Self> {
+    pub fn new(
+        job: Job,
+        s3: S3,
+        state: State,
+        crypto: Option<Arc<Crypto>>,
+        tmp_dir: PathBuf,
+    ) -> Result<Self> {
         let filter = Filter::new(&job.exclude).with_context(|| format!("job {:?}", job.name))?;
+        let crypto = crypto.filter(|_| job.encrypted);
         Ok(Self {
             job,
             filter,
             s3,
             state,
+            crypto,
+            tmp_dir,
             status: Arc::default(),
         })
     }
@@ -138,10 +151,12 @@ impl JobCtx {
             hash: *hash.as_bytes(),
         };
         let hex = hash.to_hex().to_string();
-        let key = self.job.key_for(rel);
+        let key = self.job.object_key(rel);
 
         let already_there = match prev {
             Some(p) => p.hash == entry.hash,
+            // Encrypted objects carry no hash to compare with: upload again.
+            None if self.crypto.is_some() => false,
             // Unknown locally (fresh state DB): avoid re-uploading what S3 already has.
             None => {
                 self.s3
@@ -152,9 +167,20 @@ impl JobCtx {
             }
         };
         if !already_there {
-            self.s3
-                .upload(&self.job.bucket, &key, &abs, size, &hex)
-                .await?;
+            match &self.crypto {
+                Some(c) => {
+                    let tmp = self.encrypt(c.clone(), &abs).await?;
+                    let len = tmp.as_file().metadata()?.len();
+                    self.s3
+                        .upload(&self.job.bucket, &key, tmp.path(), len, None)
+                        .await?;
+                }
+                None => {
+                    self.s3
+                        .upload(&self.job.bucket, &key, &abs, size, Some(&hex))
+                        .await?;
+                }
+            }
             // If the file changed while we read it, the upload may be torn: retry later.
             let after = self
                 .stat(&abs)
@@ -176,6 +202,19 @@ impl JobCtx {
         })
     }
 
+    /// Encrypts `abs` into a temp file that is removed when dropped.
+    async fn encrypt(&self, crypto: Arc<Crypto>, abs: &Path) -> Result<tempfile::NamedTempFile> {
+        std::fs::create_dir_all(&self.tmp_dir)
+            .with_context(|| format!("creating {}", self.tmp_dir.display()))?;
+        let tmp = tempfile::Builder::new()
+            .prefix(&format!("sync-{}-", self.job.name))
+            .suffix(".age.tmp")
+            .tempfile_in(&self.tmp_dir)?;
+        let (dst, abs) = (tmp.reopen()?, abs.to_path_buf());
+        tokio::task::spawn_blocking(move || crypto.encrypt_file(&abs, dst)).await??;
+        Ok(tmp)
+    }
+
     /// `rel` no longer exists locally. It may have been a file or a whole directory.
     async fn removed(&self, rel: &str) -> Result<Outcome> {
         let (r1, r2) = (rel.to_string(), format!("{rel}/"));
@@ -191,7 +230,7 @@ impl JobCtx {
         for r in gone {
             if self.job.delete {
                 self.s3
-                    .delete(&self.job.bucket, &self.job.key_for(&r))
+                    .delete(&self.job.bucket, &self.job.object_key(&r))
                     .await?;
                 info!(job = %self.job.name, path = %r, "deleted");
             }
@@ -217,7 +256,13 @@ impl JobCtx {
 
         let mut todo = Vec::new();
         for (rel, size, mtime_ns) in local {
-            let remote_ok = remote.get(&self.job.key_for(&rel)) == Some(&size);
+            let remote_size = remote.get(&self.job.object_key(&rel));
+            // Ciphertext size differs from the file's, so only check it is there.
+            let remote_ok = if self.crypto.is_some() {
+                remote_size.is_some()
+            } else {
+                remote_size == Some(&size)
+            };
             match tracked.remove(&rel) {
                 Some(e) if remote_ok && e.size == size && e.mtime_ns == mtime_ns => continue,
                 // Object missing or different in S3: forget it so it gets checked properly.

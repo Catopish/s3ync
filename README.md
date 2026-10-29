@@ -7,11 +7,12 @@ It can also take scheduled backups: a directory packed into one `.tar.zst` archi
 Both are configured in one `config.toml` and run by the same daemon.
 
 - One-way: local → S3. Objects that exist only in S3 are never touched.
-- Files are stored as plain objects (`<prefix>/<relative path>`), browsable in the console.
+- Files are stored as plain objects (`<prefix>/<relative path>`), browsable in the console,
+  or encrypted client-side with [age](https://age-encryption.org) (`<relative path>.age`).
 - Restarts are cheap: a local state DB remembers what was uploaded.
 - Works with AWS S3 and S3-compatible stores (MinIO, SeaweedFS, R2, ...).
 
-> Status: live sync and scheduled backups work. Client-side encryption is planned.
+> Status: live sync, scheduled backups, age encryption and restore work.
 
 ## Install
 
@@ -137,6 +138,64 @@ Exclude patterns are gitignore-like: `*.tmp` matches at any depth, `dir/` matche
 directory and everything in it, a pattern containing `/` (like `build/out`) is anchored
 to `source`.
 
+### Encryption
+
+With an `[encryption]` section every job's objects are encrypted with age before they
+leave the machine (a job can opt out with `encrypt = false`). Synced files are stored as
+`<path>.age`, backups as `.tar.zst.age`. Use your SSH key, an age key, or several:
+
+```toml
+[encryption]
+type       = "age"
+recipients = ["~/.ssh/id_ed25519.pub", "age1..."]   # public keys (or files holding them)
+identity   = "/etc/s3ync/age.key"                     # private key, used by restore
+```
+
+With no `recipients`, data is encrypted to the public key of `identity`. That key is
+never created implicitly; make it with:
+
+```sh
+s3ync keygen                  # writes encryption.identity (0600), prints the public key
+s3ync keygen -o spare.key     # another key, e.g. a spare to add to recipients
+```
+
+**Keep a copy of the private key off the machine** (password manager, offline drive):
+if the disk dies, the key goes with it, and the backups can't be decrypted. Listing a
+second recipient whose private key lives elsewhere is the easiest insurance. The daemon
+only needs public keys, so the private key need not be on the server at all when
+`recipients` is set. `~` means the home of the user s3ync runs as (`/root` for the
+default service).
+
+What stays visible to the storage provider: bucket/key names (so file paths and sizes,
+roughly), timestamps. Encrypted objects carry no content hash. Because of that, an
+encrypted sync job with a fresh state DB re-uploads everything once, and an encrypted
+backup's "unchanged" check relies on `state_dir/backups.json`.
+
+Enabling encryption on an existing job uploads everything again under the new `.age`
+keys; the old plaintext objects are left in the bucket for you to delete.
+
+### Restore
+
+`s3ync restore` works from the config alone, so it also runs on a fresh machine where the
+jobs' `source` directories don't exist. Encrypted objects are recognized by content and
+decrypted with `--identity` (an age key or SSH private key; default
+`encryption.identity`). Passphrase-protected SSH keys are prompted for, or read from
+`S3YNC_PASSPHRASE`.
+
+```sh
+s3ync restore --job db-dumps --list                          # backups available
+s3ync restore --job db-dumps --to /tmp/db                    # the latest
+s3ync restore --job db-dumps --to /tmp/db --at 2026-10-29    # last one of that day
+s3ync restore --job db-dumps --to /tmp/db --version-id ID    # naming = "fixed", versioned bucket
+s3ync restore --job photos --to /tmp/photos -i ~/.ssh/id_ed25519
+s3ync restore --job photos --to /tmp/photos --path 2024/summer
+```
+
+The target must be empty (backups) or existing files are skipped (sync jobs), unless
+`--force`. Unencrypted backups are checked against their stored hash; age protects the
+integrity of encrypted ones. Paths that would escape the target (`..`, absolute) are
+refused.
+
 ### The bucket
 
 s3ync never creates buckets; create it yourself. Recommended:
@@ -159,7 +218,7 @@ Minimal IAM policy:
   "Statement": [
     { "Effect": "Allow", "Action": ["s3:ListBucket"],
       "Resource": "arn:aws:s3:::my-bucket" },
-    { "Effect": "Allow", "Action": ["s3:GetBucketVersioning"],
+    { "Effect": "Allow", "Action": ["s3:GetBucketVersioning", "s3:ListBucketVersions"],
       "Resource": "arn:aws:s3:::my-bucket" },
     { "Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
       "Resource": "arn:aws:s3:::my-bucket/*" }
@@ -176,6 +235,10 @@ Minimal IAM policy:
 | `s3ync once [--job NAME]` | One reconcile pass, then exit (non-zero if anything failed) |
 | `s3ync status` | Per-job counters from the running daemon (last/next backup too) |
 | `s3ync backup [--job NAME]` | Archive and upload backup jobs, then exit (non-zero if any failed) |
+| `s3ync restore --job NAME --to DIR` | Restore a backup or a sync job's files (see above) |
+| `s3ync keygen [-o FILE]` | Create an age key pair for `[encryption]` |
+
+`s3ync --help` and `s3ync <command> --help` describe every flag.
 
 Global flags: `-c/--config` (default `/etc/s3ync/config.toml`, env `S3YNC_CONFIG`),
 `--env` (default `./.env` if present, env `S3YNC_ENV`). Log level: `S3YNC_LOG=s3ync=debug`.
@@ -183,8 +246,11 @@ Global flags: `-c/--config` (default `/etc/s3ync/config.toml`, env `S3YNC_CONFIG
 ## How it works
 
 - **Change detection**: size + mtime as a fast check, BLAKE3 hash to decide whether
-  content actually changed. The hash is stored in object metadata (`x-amz-meta-s3ync-hash`),
-  so with a fresh state DB existing objects are verified with a HEAD instead of re-uploaded.
+  content actually changed. The hash is stored in object metadata (`x-amz-meta-s3ync-hash`,
+  unencrypted objects only), so with a fresh state DB existing objects are verified with
+  a HEAD instead of re-uploaded.
+- **Encryption**: files are encrypted into a temp file under `state_dir/tmp`, then
+  uploaded; backups are encrypted as they are written (tar → zstd → age).
 - **Watching**: events are debounced (`debounce_ms`), then queued; uploads run with
   bounded concurrency and retry with exponential backoff (up to 5 min).
 - **Torn writes**: if a file changes while it's being uploaded, the upload is retried.
