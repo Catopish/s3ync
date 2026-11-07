@@ -113,6 +113,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          # Only the binaries: docker/build-push-action uploads its own build record too.
+          pattern: "*-linux-musl"
           path: out
           merge-multiple: true
       - name: Create release
