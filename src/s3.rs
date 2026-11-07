@@ -4,6 +4,8 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use aws_config::BehaviorVersion;
 use aws_sdk_s3::Client;
+use aws_sdk_s3::config::http::HttpResponse;
+use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -47,26 +49,26 @@ impl S3 {
     }
 
     /// Checks the bucket exists and we can list under `prefix`.
+    /// Uses ListObjectsV2 rather than HeadBucket: HEAD responses carry no error code, and
+    /// some stores (R2) answer 403 for both a missing bucket and bad credentials.
     pub async fn check(&self, bucket: &str, prefix: &str) -> Result<()> {
-        if let Err(e) = self.client.head_bucket().bucket(bucket).send().await {
-            let e = e.into_service_error();
-            if e.is_not_found() {
-                bail!("bucket {bucket:?} does not exist (s3ync does not create buckets)");
-            }
-            return Err(anyhow::anyhow!(e)).with_context(|| {
-                format!("bucket {bucket:?} not reachable (credentials/region ok?)")
-            });
-        }
-        self.client
+        let res = self
+            .client
             .list_objects_v2()
             .bucket(bucket)
             .prefix(prefix)
             .max_keys(1)
             .send()
-            .await
-            .map_err(|e| anyhow::anyhow!(e.into_service_error()))
-            .with_context(|| format!("cannot list s3://{bucket}/{prefix}"))?;
-        Ok(())
+            .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(SdkError::ServiceError(se)) if se.err().is_no_such_bucket() => {
+                bail!("bucket {bucket:?} does not exist (s3ync does not create buckets)")
+            }
+            Err(e) => Err(sdk_err(e)).with_context(|| {
+                format!("cannot list s3://{bucket}/{prefix} (credentials/region ok?)")
+            }),
+        }
     }
 
     /// Whether bucket versioning is enabled. Errors if we may not ask (s3:GetBucketVersioning).
@@ -77,7 +79,7 @@ impl S3 {
             .bucket(bucket)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!(e.into_service_error()))
+            .map_err(sdk_err)
             .with_context(|| format!("get versioning of bucket {bucket:?}"))?;
         Ok(out.status() == Some(&BucketVersioningStatus::Enabled))
     }
@@ -94,7 +96,7 @@ impl S3 {
             .send();
         while let Some(page) = pages.next().await {
             let page = page
-                .map_err(|e| anyhow::anyhow!(e.into_service_error()))
+                .map_err(sdk_err)
                 .with_context(|| format!("listing s3://{bucket}/{prefix}"))?;
             for obj in page.contents() {
                 if let Some(k) = obj.key() {
@@ -116,14 +118,8 @@ impl S3 {
             .await
         {
             Ok(out) => Ok(out.metadata().and_then(|m| m.get(HASH_META)).cloned()),
-            Err(e) => {
-                let e = e.into_service_error();
-                if e.is_not_found() {
-                    Ok(None)
-                } else {
-                    Err(anyhow::anyhow!(e)).with_context(|| format!("head s3://{bucket}/{key}"))
-                }
-            }
+            Err(SdkError::ServiceError(se)) if se.err().is_not_found() => Ok(None),
+            Err(e) => Err(sdk_err(e)).with_context(|| format!("head s3://{bucket}/{key}")),
         }
     }
 
@@ -149,7 +145,7 @@ impl S3 {
             .body(body)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!(e.into_service_error()))
+            .map_err(sdk_err)
             .with_context(|| format!("put s3://{bucket}/{key}"))?;
         Ok(())
     }
@@ -169,7 +165,7 @@ impl S3 {
             .set_metadata(hash.map(|h| [(HASH_META.to_string(), h.to_string())].into()))
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!(e.into_service_error()))
+            .map_err(sdk_err)
             .with_context(|| format!("create multipart s3://{bucket}/{key}"))?;
         let upload_id = created
             .upload_id()
@@ -190,7 +186,7 @@ impl S3 {
                     )
                     .send()
                     .await
-                    .map_err(|e| anyhow::anyhow!(e.into_service_error()))
+                    .map_err(sdk_err)
                     .with_context(|| format!("complete multipart s3://{bucket}/{key}"))?;
                 Ok(())
             }
@@ -241,7 +237,7 @@ impl S3 {
                 .body(ByteStream::from(buf))
                 .send()
                 .await
-                .map_err(|e| anyhow::anyhow!(e.into_service_error()))
+                .map_err(sdk_err)
                 .with_context(|| format!("upload part {part_number} of s3://{bucket}/{key}"))?;
             parts.push(
                 CompletedPart::builder()
@@ -267,14 +263,8 @@ impl S3 {
             .await
         {
             Ok(_) => Ok(true),
-            Err(e) => {
-                let e = e.into_service_error();
-                if e.is_not_found() {
-                    Ok(false)
-                } else {
-                    Err(anyhow::anyhow!(e)).with_context(|| format!("head s3://{bucket}/{key}"))
-                }
-            }
+            Err(SdkError::ServiceError(se)) if se.err().is_not_found() => Ok(false),
+            Err(e) => Err(sdk_err(e)).with_context(|| format!("head s3://{bucket}/{key}")),
         }
     }
 
@@ -294,7 +284,7 @@ impl S3 {
             .set_version_id(version.map(str::to_string))
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!(e.into_service_error()))
+            .map_err(sdk_err)
             .with_context(|| format!("get s3://{bucket}/{key}"))?;
         let hash = out.metadata().and_then(|m| m.get(HASH_META)).cloned();
         let mut body = out.body.into_async_read();
@@ -319,7 +309,7 @@ impl S3 {
                 .set_version_id_marker(version_marker.take())
                 .send()
                 .await
-                .map_err(|e| anyhow::anyhow!(e.into_service_error()))
+                .map_err(sdk_err)
                 .with_context(|| format!("listing versions of s3://{bucket}/{key}"))?;
             for v in page.versions() {
                 if v.key() != Some(key) {
@@ -349,8 +339,27 @@ impl S3 {
             .key(key)
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!(e.into_service_error()))
+            .map_err(sdk_err)
             .with_context(|| format!("delete s3://{bucket}/{key}"))?;
         Ok(())
     }
+}
+
+/// SDK errors display as just "service error" / "unhandled error". Show the S3 error code,
+/// or the HTTP status when the response has no body (HEAD requests), or the underlying
+/// cause (DNS, TLS, timeout, ...) when no response came back.
+fn sdk_err<E>(e: SdkError<E, HttpResponse>) -> anyhow::Error
+where
+    E: ProvideErrorMetadata + std::error::Error + Send + Sync + 'static,
+{
+    if let SdkError::ServiceError(se) = &e {
+        let status = se.raw().status().as_u16();
+        let err = se.err();
+        return match (err.code(), err.message()) {
+            (Some(code), Some(msg)) => anyhow::anyhow!("{code}: {msg} (HTTP {status})"),
+            (Some(code), None) => anyhow::anyhow!("{code} (HTTP {status})"),
+            _ => anyhow::anyhow!("HTTP {status}"),
+        };
+    }
+    anyhow::Error::new(e)
 }
