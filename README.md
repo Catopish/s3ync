@@ -21,6 +21,9 @@ their `schedule`), `s3ync backup` takes backups once and exits. Pick how to host
 
 ### systemd
 
+Static Linux binaries (x86_64, aarch64) are attached to each
+[release](https://github.com/Catopish/s3ync/releases); unpack one and skip the build step.
+
 ```sh
 cargo build --release
 sudo install -m755 target/release/s3ync /usr/local/bin/
