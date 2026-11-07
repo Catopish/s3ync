@@ -190,18 +190,6 @@ wait_for 'log_has "backup uploaded.*job=backup"' 75
 pass "daemon took the scheduled backup"
 stop_daemon
 
-step "backup-only daemon"
-# The config up to the first [[job]], plus only the scheduled backup job.
-{
-    sed '/^\[\[job\]\]/,$d' "$CFG"
-    awk '/^\[\[job\]\]/{n++} n==3' "$CFG"
-} >"$W/backup-only.toml"
-"$BIN" -c "$W/backup-only.toml" run >"$W/daemon.log" 2>&1 &
-DAEMON_PID=$!
-wait_for 'log_has " ready "' 20
-pass "daemon starts with no sync jobs"
-stop_daemon
-
 step "manual backups"
 out=$(s3 backup --job backup) && grep -q "(unchanged)" <<<"$out" && pass "unchanged backup not uploaded" || fail "$out"
 for i in 1 2 3; do
@@ -250,6 +238,19 @@ grep -q "not empty" <<<"$out" && pass "backup into non-empty dir refused" || fai
 "$BIN" keygen -o "$W/wrong.key" >/dev/null 2>&1
 out=$(s3 restore --job enc --to "$R/wrong" -i "$W/wrong.key") && fail "restored with wrong key"
 grep -q "No matching keys" <<<"$out" && pass "wrong key rejected" || fail "$out"
+
+step "backup-only daemon"
+# Last: it rewrites status.json and takes a catch-up backup.
+# The config up to the first [[job]], plus only the scheduled backup job.
+{
+    sed '/^\[\[job\]\]/,$d' "$CFG"
+    awk '/^\[\[job\]\]/{n++} n==3' "$CFG"
+} >"$W/backup-only.toml"
+"$BIN" -c "$W/backup-only.toml" run >"$W/daemon.log" 2>&1 &
+DAEMON_PID=$!
+wait_for 'log_has " ready "' 20
+pass "daemon starts with no sync jobs"
+stop_daemon
 
 echo
 echo "all $PASS checks passed"

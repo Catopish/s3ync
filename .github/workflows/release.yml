@@ -1,7 +1,7 @@
 name: release
 
-# Everything runs on version tags only: lint + tests, an end-to-end run against R2,
-# a Docker build, static Linux binaries, and a GitHub release once all of them pass.
+# On version tags: the full CI (ci.yml), then static Linux binaries, and a GitHub
+# release once all of them pass.
 on:
   push:
     tags: ["v*"]
@@ -13,60 +13,24 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
+  version:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
       - name: Tag matches Cargo.toml version
         run: |
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
             exit 1
           fi
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --locked -- -D warnings
-      - run: cargo test --locked
-
-  e2e:
-    runs-on: ubuntu-latest
-    # One run at a time against the shared test bucket.
-    concurrency: r2-e2e
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked
-      - name: End-to-end test against R2
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.CF_TESTBUCKET_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_TESTBUCKET_SECRET_ACCESS_KEY }}
-          AWS_ENDPOINT_URL: ${{ secrets.R2_TEST_ENDPOINT }}
-          AWS_REGION: auto
-          S3YNC_TEST_BUCKET: ${{ secrets.CF_TESTBUCKET_NAME }}
-          S3YNC_TEST_RUN: ${{ github.run_id }}-${{ github.run_attempt }}
-          S3YNC_BIN: target/release/s3ync
-        run: tests/e2e.sh
-
-  docker:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          load: true
-          tags: s3ync:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-      - run: docker run --rm s3ync:ci --version
 
   build:
+    needs: version
     strategy:
       matrix:
         include:
@@ -106,7 +70,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [check, e2e, docker, build]
+    needs: [ci, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write

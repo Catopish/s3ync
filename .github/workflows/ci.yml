@@ -1,0 +1,61 @@
+name: ci
+
+# Lint, unit tests, an end-to-end run against R2 and a Docker build on every branch
+# push. release.yml runs this too before building a tagged release.
+on:
+  push:
+    branches: ["**"]
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  e2e:
+    runs-on: ubuntu-latest
+    # One run at a time against the shared test bucket.
+    concurrency: r2-e2e
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: End-to-end test against R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CF_TESTBUCKET_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CF_TESTBUCKET_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.R2_TEST_ENDPOINT }}
+          AWS_REGION: auto
+          S3YNC_TEST_BUCKET: ${{ secrets.CF_TESTBUCKET_NAME }}
+          S3YNC_TEST_RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+          S3YNC_BIN: target/release/s3ync
+        run: tests/e2e.sh
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: s3ync:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - run: docker run --rm s3ync:ci --version
