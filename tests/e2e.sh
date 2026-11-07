@@ -190,6 +190,18 @@ wait_for 'log_has "backup uploaded.*job=backup"' 75
 pass "daemon took the scheduled backup"
 stop_daemon
 
+step "backup-only daemon"
+# The config up to the first [[job]], plus only the scheduled backup job.
+{
+    sed '/^\[\[job\]\]/,$d' "$CFG"
+    awk '/^\[\[job\]\]/{n++} n==3' "$CFG"
+} >"$W/backup-only.toml"
+"$BIN" -c "$W/backup-only.toml" run >"$W/daemon.log" 2>&1 &
+DAEMON_PID=$!
+wait_for 'log_has " ready "' 20
+pass "daemon starts with no sync jobs"
+stop_daemon
+
 step "manual backups"
 out=$(s3 backup --job backup) && grep -q "(unchanged)" <<<"$out" && pass "unchanged backup not uploaded" || fail "$out"
 for i in 1 2 3; do

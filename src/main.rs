@@ -425,7 +425,8 @@ async fn run(cfg: Config) -> Result<()> {
     let rescan = (cfg.global.rescan_interval_secs > 0)
         .then(|| Duration::from_secs(cfg.global.rescan_interval_secs));
 
-    let (ready_tx, mut ready_rx) = mpsc::channel(jobs.len());
+    // At least 1: a backup-only config has no sync jobs, and a 0-capacity channel panics.
+    let (ready_tx, mut ready_rx) = mpsc::channel(jobs.len().max(1));
     let mut handles = Vec::new();
     for ctx in &jobs {
         let fut = sync::run_watch(
