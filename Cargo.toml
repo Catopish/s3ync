@@ -1,6 +1,6 @@
 [package]
 name = "s3ync"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Daemon that syncs local directories to S3"
 license = "GPL-3.0-only"
